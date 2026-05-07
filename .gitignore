@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual envs
+.venv/
+
+# Env / secrets
+.env
+.env.local
+
+# Local DB and caches
+data/*.db
+data/*.db-journal
+data/*.parquet
+data/cache/
+*.log
+logs/
+
+# Reports / charts
+reports/output/
+reports/charts/
+
+# IDE
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
