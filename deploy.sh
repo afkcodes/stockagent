@@ -85,13 +85,25 @@ if [[ "$EUID" -ne 0 ]]; then
 fi
 
 log "apt-get update + installing essentials..."
-$SUDO apt-get update -qq
-$SUDO apt-get install -y -qq \
+# DEBIAN_FRONTEND=noninteractive: suppresses dpkg config prompts
+# NEEDRESTART_MODE=a: makes needrestart auto-restart services without prompting
+# (without these, Ubuntu 22.04+ apt-get hangs forever waiting on an invisible prompt)
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+$SUDO -E apt-get update -qq
+$SUDO -E apt-get install -y -qq \
     curl ca-certificates build-essential \
     libsqlite3-dev tzdata cron \
     libxml2-dev libxslt1-dev zlib1g-dev \
     >/dev/null
 ok "system packages installed"
+
+# Make this fix permanent on this machine for any future apt-get runs
+if [[ -f /etc/needrestart/needrestart.conf ]] && ! grep -q "^\$nrconf{restart} = 'a';" /etc/needrestart/needrestart.conf 2>/dev/null; then
+    $SUDO sed -i "s/#\$nrconf{restart} = 'i';/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf 2>/dev/null || true
+fi
 
 # Ensure cron is enabled + running
 $SUDO systemctl enable --now cron >/dev/null 2>&1 || true
