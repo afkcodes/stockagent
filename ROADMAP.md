@@ -101,6 +101,38 @@ Plus bonus: full multi-agent orchestration framework (4 agents, parallel, formul
 **Build:** simple `python-telegram-bot` integration. After `daily-tick` runs, push a formatted summary (NAV, open positions, tomorrow's picks) to the configured chat ID. Cron the daily-tick at 15:40 IST.
 **Expected impact:** operational, not strategy. But missing 3 days of daily-tick = missing 3 days of paper validation = real cost.
 
+### Tier 1.5 — Per-symbol institutional memory (added 2026-05-09)
+
+**Built ✓ in this session:** `stockagent symbol-profile [--symbol SYM | --top N]` — aggregates every coordinator decision, agent verdict, and paper trade per symbol. Lets you ask "what's the system's track record on TCS?" or "which 20 stocks does it pick most?"
+
+**Deferred (build when needed, not before):**
+
+#### Save chart images per pick (~15 min)
+Currently `agents/charts.py` renders a 60-day candle chart for the LLM call and discards it. Persist to `reports/charts/<run_id>/<symbol>.png` so the visual evidence behind every verdict is auditable later.
+Why useful: end-of-month review, you can see exactly what the LLM was looking at when it called PIIND a "falling knife" and decide if you agree in hindsight.
+**Cost:** none — chart is already rendered.
+
+#### Monthly fundamentals snapshot cron (~1 hour)
+Run `data/screener.py::fetch_fundamentals` once a month for all Nifty 500 names, store in `fundamentals` table (already in schema). Over 12 months you accumulate a fundamentals trajectory per symbol — see whether ROE has been climbing or debt rising.
+Why useful: enables fundamental-trend signals (e.g., "ROE rising for 4 consecutive quarters" = quality momentum). Currently the fundamental agent only sees one snapshot.
+Effort: cron line + one CLI command `stockagent fundamentals-snapshot`.
+
+#### Quarterly earnings results history (~3-4 hours)
+Scrape quarterly results from screener.in or moneycontrol per symbol. YoY growth, sequential growth, beat/miss vs prior quarter. Builds a results table that's currently missing.
+Why useful: **unlocks the PEAD/earnings-momentum strategy** in Tier 3. Without this, we can't build that strategy honestly.
+Effort: results page parser + nightly cron + new `earnings_results` table.
+
+#### Historical corporate actions backfill (~2 hours)
+nselib has full corporate-actions history. Currently we only fetch upcoming 60 days. Backfilling 5 years lets us properly compute split-adjusted long-horizon returns.
+Why useful: more accurate backtests on stocks that had splits/bonuses (e.g., HDFCBANK had a 2:1 in July 2025 — our prices already reflect this via bhav, but if we ever want to compare entry prices with the *original* paid value, we need the calendar).
+Effort: extend `data/events.py::refresh_corporate_actions` to support arbitrary date ranges + a one-time backfill command.
+
+### Not worth building (decision-stable)
+
+- **Retroactive news archive** — Google News doesn't expose old items reliably; paid sources start at $50/mo. Marginal benefit for sentiment trends. Skip.
+- **Intraday minute bars** — paid (Fyers/Kite). Only useful for an intraday strategy. We're swing — daily close is what we need. Skip.
+- **Tick-by-tick data** — institutional-grade. Would cost ₹5K-50K/month. Way overkill for personal-use swing trading. Skip.
+
 ### Tier 2 — Build later (medium impact or higher complexity)
 
 #### 6. Sentiment/news agent on held positions (~3-4 hours)

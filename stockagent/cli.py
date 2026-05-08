@@ -620,6 +620,134 @@ def paper_reset_cmd() -> None:
     console.print("[yellow]Wiped.[/]")
 
 
+@cli.command("symbol-profile")
+@click.option("--symbol", default=None, help="Single symbol; omit to show top-N table across all symbols")
+@click.option("--top", default=20, type=int, help="Top N symbols by pick count when --symbol omitted")
+def symbol_profile_cmd(symbol: str | None, top: int) -> None:
+    """The system's track record per symbol — how often we picked it, win rate, P&L."""
+    from sqlalchemy import text as _t
+    from stockagent.data.sectors import sector_for
+
+    engine = get_engine()
+    if symbol:
+        sym = symbol.upper()
+        with engine.connect() as c:
+            decisions = list(c.execute(_t(
+                """SELECT id, run_id, conviction, entry, stop_loss, target,
+                          position_size_inr, qty, final_verdict, rationale, created_at
+                   FROM coordinator_decisions
+                   WHERE symbol = :s ORDER BY created_at DESC"""
+            ), {"s": sym}).mappings())
+            trades = list(c.execute(_t(
+                """SELECT pt.id, pt.entry_date, pt.entry_price, pt.qty,
+                          pt.exit_date, pt.exit_price, pt.exit_reason,
+                          pt.pnl_inr, pt.pnl_pct, pt.status
+                   FROM paper_trades pt
+                   WHERE pt.symbol = :s ORDER BY pt.entry_date DESC"""
+            ), {"s": sym}).mappings())
+            agent_rows = list(c.execute(_t(
+                """SELECT agent, verdict, conviction, reasoning, created_at, run_id
+                   FROM agent_outputs
+                   WHERE symbol = :s AND agent != 'orchestrator'
+                   ORDER BY created_at DESC LIMIT 30"""
+            ), {"s": sym}).mappings())
+
+        if not decisions:
+            console.print(f"[dim]No system activity for {sym} yet.[/]")
+            return
+
+        sector = sector_for(sym)
+        closed = [t for t in trades if t["status"] == "closed"]
+        winners = [t for t in closed if (t["pnl_inr"] or 0) > 0]
+        win_rate = len(winners) / len(closed) * 100 if closed else 0
+        total_pnl = sum((t["pnl_inr"] or 0) for t in closed)
+
+        console.rule(f"[bold]{sym}[/]  ({sector})")
+        console.print(
+            f"  Picked:     {len(decisions)} times    last on {decisions[0]['created_at']}\n"
+            f"  Avg conv:   {sum(d['conviction'] for d in decisions)/len(decisions):.2f}\n"
+            f"  Trades:     {len(closed)} closed, {len(trades) - len(closed)} open\n"
+            f"  Win rate:   {win_rate:.1f}%   ({len(winners)}/{len(closed)})\n"
+            f"  Total P&L:  ₹{total_pnl:>+10,.0f}"
+        )
+
+        if trades:
+            console.print(f"\n[bold]Trade history[/]")
+            for t in trades[:10]:
+                if t["status"] == "open":
+                    console.print(f"  [yellow]OPEN[/] {t['entry_date']} entry ₹{t['entry_price']:.2f} qty {t['qty']}")
+                else:
+                    pnl = t["pnl_inr"] or 0
+                    color = "green" if pnl > 0 else "red"
+                    console.print(
+                        f"  {t['entry_date']} → {t['exit_date']}  ₹{t['entry_price']:>8.2f} → ₹{(t['exit_price'] or 0):>8.2f}  "
+                        f"qty {t['qty']:>3}  [{color}]₹{pnl:>+8,.0f}[/]  ({(t['pnl_pct'] or 0)*100:>+5.2f}%)  ({t['exit_reason']})"
+                    )
+
+        if decisions:
+            console.print(f"\n[bold]Most recent decisions[/]")
+            for d in decisions[:5]:
+                console.print(
+                    f"  {d['created_at'][:10]}  {d['final_verdict']:8s}  conv {d['conviction']:.2f}  "
+                    f"entry ₹{d['entry']:.2f}  stop ₹{d['stop_loss']:.2f}"
+                )
+                if d["rationale"]:
+                    console.print(f"    [dim]{d['rationale'][:200]}[/]")
+
+        if agent_rows:
+            console.print(f"\n[bold]Most recent agent verdicts[/]")
+            seen_runs = set()
+            for r in agent_rows:
+                if r["run_id"] in seen_runs and len([x for x in agent_rows if x["run_id"] == r["run_id"]]) > 4:
+                    continue
+                seen_runs.add(r["run_id"])
+                console.print(
+                    f"  {r['created_at'][:10]}  {r['agent']:12s}  {r['verdict']:8s}  "
+                    f"conv {r['conviction']:.2f}"
+                )
+        return
+
+    # Top-N table
+    with engine.connect() as c:
+        rows = list(c.execute(_t(
+            """SELECT cd.symbol,
+                      COUNT(DISTINCT cd.id) AS picks,
+                      AVG(cd.conviction) AS avg_conv,
+                      MAX(cd.created_at) AS last_picked,
+                      SUM(CASE WHEN pt.status='closed' THEN 1 ELSE 0 END) AS closed,
+                      SUM(CASE WHEN pt.status='open'   THEN 1 ELSE 0 END) AS open_t,
+                      SUM(CASE WHEN pt.status='closed' AND pt.pnl_inr > 0 THEN 1 ELSE 0 END) AS winners,
+                      SUM(COALESCE(pt.pnl_inr, 0)) AS total_pnl
+               FROM coordinator_decisions cd
+               LEFT JOIN paper_trades pt ON pt.decision_id = cd.id
+               GROUP BY cd.symbol
+               ORDER BY picks DESC, total_pnl DESC
+               LIMIT :n"""
+        ), {"n": top}).mappings())
+
+    if not rows:
+        console.print("[dim]No system activity yet. Run daily-tick first.[/]")
+        return
+
+    console.rule(f"[bold]Symbol profiles — top {len(rows)} by pick count[/]")
+    console.print(
+        f"  [dim]{'symbol':14s}  {'sector':18s}  {'picks':>5}  {'avg conv':>8}  "
+        f"{'closed':>6}  {'open':>4}  {'win%':>5}  {'total P&L':>12}  {'last picked':>12}[/]"
+    )
+    for r in rows:
+        sym = r["symbol"]
+        sector = sector_for(sym)
+        wr = (r["winners"] / r["closed"] * 100) if r["closed"] else 0
+        pnl = r["total_pnl"] or 0
+        color = "green" if pnl > 0 else ("red" if pnl < 0 else "white")
+        console.print(
+            f"  {sym:14s}  {sector:18s}  {r['picks']:>5}  {(r['avg_conv'] or 0):>8.2f}  "
+            f"{r['closed']:>6}  {r['open_t']:>4}  {wr:>4.1f}%  "
+            f"[{color}]₹{pnl:>+11,.0f}[/]  {(r['last_picked'] or '')[:10]:>12}"
+        )
+    console.rule()
+
+
 @cli.command("paper-summary")
 @click.option("--start", default=None, help="ISO YYYY-MM-DD; defaults to first paper trade")
 @click.option("--end", default=None, help="ISO YYYY-MM-DD; defaults to today")
