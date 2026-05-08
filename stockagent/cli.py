@@ -620,6 +620,121 @@ def paper_reset_cmd() -> None:
     console.print("[yellow]Wiped.[/]")
 
 
+@cli.command("paper-summary")
+@click.option("--start", default=None, help="ISO YYYY-MM-DD; defaults to first paper trade")
+@click.option("--end", default=None, help="ISO YYYY-MM-DD; defaults to today")
+def paper_summary_cmd(start: str | None, end: str | None) -> None:
+    """End-of-period review: P&L, win rate, per-sector breakdown, drawdown."""
+    import statistics
+    from sqlalchemy import text as _t
+
+    engine = get_engine()
+    with engine.connect() as c:
+        # Closed trades in window
+        where = ""
+        params: dict = {}
+        if start:
+            where += " AND entry_date >= :s"
+            params["s"] = start
+        if end:
+            where += " AND (exit_date IS NULL OR exit_date <= :e)"
+            params["e"] = end
+        trades = list(c.execute(_t(
+            f"""SELECT pt.symbol, pt.qty, pt.entry_price, pt.entry_date,
+                       pt.exit_price, pt.exit_date, pt.exit_reason,
+                       pt.pnl_inr, pt.pnl_pct, pt.status
+                FROM paper_trades pt
+                WHERE 1=1 {where}
+                ORDER BY pt.entry_date"""
+        ), params).mappings())
+
+        # Portfolio NAV curve
+        ps = list(c.execute(_t(
+            f"""SELECT date, nav_inr, day_pnl_inr, deployed_inr, cash_inr
+                FROM portfolio_state
+                WHERE 1=1 {where.replace('entry_date', 'date').replace('exit_date IS NULL OR exit_date', 'date')}
+                ORDER BY date"""
+        ), params).mappings())
+
+    if not trades and not ps:
+        console.print("[dim]No paper-trade activity in this window. Run daily-tick first.[/]")
+        return
+
+    closed = [t for t in trades if t["status"] == "closed"]
+    open_t = [t for t in trades if t["status"] == "open"]
+
+    # P&L metrics
+    pnl_total = sum((t["pnl_inr"] or 0) for t in closed)
+    winners = [t for t in closed if (t["pnl_inr"] or 0) > 0]
+    losers = [t for t in closed if (t["pnl_inr"] or 0) <= 0]
+    win_rate = len(winners) / len(closed) * 100 if closed else 0
+    avg_winner = statistics.mean((t["pnl_pct"] or 0) for t in winners) * 100 if winners else 0
+    avg_loser = statistics.mean((t["pnl_pct"] or 0) for t in losers) * 100 if losers else 0
+    gross_win = sum((t["pnl_inr"] or 0) for t in winners)
+    gross_loss = abs(sum((t["pnl_inr"] or 0) for t in losers))
+    pf = gross_win / gross_loss if gross_loss > 0 else float("inf") if gross_win > 0 else 0
+
+    # NAV curve metrics
+    final_nav = float(ps[-1]["nav_inr"]) if ps else settings.capital_inr
+    starting = settings.capital_inr
+    total_ret_pct = (final_nav - starting) / starting * 100
+    if ps:
+        navs = [float(r["nav_inr"]) for r in ps]
+        peak = navs[0]
+        max_dd = 0
+        for n in navs:
+            peak = max(peak, n)
+            dd = (n - peak) / peak * 100
+            max_dd = min(max_dd, dd)
+    else:
+        max_dd = 0
+
+    # Per-sector breakdown via sector_for
+    from stockagent.data.sectors import sector_for
+    sector_pnl: dict[str, float] = {}
+    sector_count: dict[str, int] = {}
+    for t in closed:
+        s = sector_for(t["symbol"])
+        sector_pnl[s] = sector_pnl.get(s, 0) + (t["pnl_inr"] or 0)
+        sector_count[s] = sector_count.get(s, 0) + 1
+
+    # Best/worst trades
+    best = sorted(closed, key=lambda t: t["pnl_inr"] or 0, reverse=True)[:3]
+    worst = sorted(closed, key=lambda t: t["pnl_inr"] or 0)[:3]
+
+    console.rule(f"[bold]Paper-trade summary[/]")
+    console.print(f"Window:           {ps[0]['date'] if ps else '—'} → {ps[-1]['date'] if ps else '—'}  ({len(ps)} trading days)\n")
+    console.print(f"Starting capital: ₹{starting:>12,.0f}")
+    console.print(f"Final NAV:        ₹{final_nav:>12,.0f}  ({total_ret_pct:+.2f}%)")
+    console.print(f"Realized P&L:     ₹{pnl_total:>+12,.0f}  ({len(closed)} closed trades)")
+    console.print(f"Open positions:   {len(open_t)}")
+    console.print(f"Max drawdown:     {max_dd:+.2f}%\n")
+
+    console.print(f"[bold]Trade stats[/]")
+    console.print(f"  Win rate:        {win_rate:.1f}%   ({len(winners)} W / {len(losers)} L)")
+    console.print(f"  Avg winner:      {avg_winner:+.2f}%   gross ₹{gross_win:,.0f}")
+    console.print(f"  Avg loser:       {avg_loser:+.2f}%   gross ₹{gross_loss:,.0f}")
+    console.print(f"  Profit factor:   {pf:.2f}\n")
+
+    if sector_pnl:
+        console.print(f"[bold]Per-sector P&L[/]")
+        for s, pnl in sorted(sector_pnl.items(), key=lambda x: x[1], reverse=True):
+            n = sector_count[s]
+            console.print(f"  {s:25s}  {n:>3} trades   ₹{pnl:>+12,.0f}")
+        console.print()
+
+    if best:
+        console.print(f"[bold]Best 3 trades[/]")
+        for t in best:
+            console.print(f"  {t['symbol']:14s}  {t['entry_date']} → {t['exit_date']}  ₹{t['pnl_inr']:>+8,.0f}  ({(t['pnl_pct'] or 0)*100:>+5.2f}%)  {t['exit_reason']}")
+    if worst:
+        console.print(f"\n[bold]Worst 3 trades[/]")
+        for t in worst:
+            console.print(f"  {t['symbol']:14s}  {t['entry_date']} → {t['exit_date']}  ₹{t['pnl_inr']:>+8,.0f}  ({(t['pnl_pct'] or 0)*100:>+5.2f}%)  {t['exit_reason']}")
+
+    console.rule()
+
+
 @cli.command("stats")
 def stats_cmd() -> None:
     """Quick DB stats."""
