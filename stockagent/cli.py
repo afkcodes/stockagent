@@ -151,7 +151,8 @@ def backfill_yf_cmd(start: str, end: str | None, universe: str, symbols: str | N
 @cli.command("backtest")
 @click.argument("strategy_name", type=click.Choice(["ema_crossover", "rsi_mean_reversion", "bollinger_breakout",
                                        "ema_crossover_filtered", "rsi_mean_reversion_filtered",
-                                       "bollinger_breakout_filtered", "delivery_anomaly"]))
+                                       "bollinger_breakout_filtered", "delivery_anomaly",
+                                       "rsi_mean_reversion_mtf"]))
 @click.option("--universe", default="nifty50", type=click.Choice(["nifty50", "nifty500", "custom"]))
 @click.option("--symbols", default=None, help="Comma-separated when universe=custom")
 @click.option("--start", default="2020-01-01")
@@ -205,7 +206,8 @@ def backtest_cmd(strategy_name: str, universe: str, symbols: str | None, start: 
 @cli.command("walkforward")
 @click.argument("strategy_name", type=click.Choice(["ema_crossover", "rsi_mean_reversion", "bollinger_breakout",
                                        "ema_crossover_filtered", "rsi_mean_reversion_filtered",
-                                       "bollinger_breakout_filtered", "delivery_anomaly"]))
+                                       "bollinger_breakout_filtered", "delivery_anomaly",
+                                       "rsi_mean_reversion_mtf"]))
 @click.option("--universe", default="nifty50", type=click.Choice(["nifty50", "nifty500", "liquid", "custom"]))
 @click.option("--symbols", default=None)
 @click.option("--start", default="2020-06-01")
@@ -393,18 +395,26 @@ def pd_notna(v) -> bool:
 @cli.command("daily-tick")
 @click.option("--universe", default="nifty500", type=click.Choice(["nifty50", "nifty500"]))
 @click.option("--max-picks", default=5, type=int)
-@click.option("--min-conviction", default=0.3, type=float)
+@click.option("--min-conviction", default=0.45, type=float)
 @click.option("--skip-bhav-refresh", is_flag=True, help="Don't pull today's bhav (use existing DB)")
 @click.option("--skip-movers", is_flag=True, help="Don't fetch live market movers (use last fetch)")
-def daily_tick_cmd(universe: str, max_picks: int, min_conviction: float, skip_bhav_refresh: bool, skip_movers: bool) -> None:
+@click.option("--skip-events", is_flag=True, help="Don't refresh the corporate-actions calendar")
+@click.option("--no-llm", is_flag=True, help="Skip the LLM agents; use deterministic baseline only")
+@click.option("--no-sentiment", is_flag=True, help="Skip the sentiment agent (faster, no news fetch)")
+@click.option("--no-telegram", is_flag=True, help="Don't send Telegram summary")
+def daily_tick_cmd(universe, max_picks, min_conviction, skip_bhav_refresh, skip_movers,
+                   skip_events, no_llm, no_sentiment, no_telegram) -> None:
     """End-of-day routine: refresh data → process paper trades → generate tomorrow's watchlist.
 
     Run this once daily after 15:35 IST. Each step is independent — failures in one
-    don't block the others. The output is your action list for tomorrow's open."""
+    don't block the others."""
     from datetime import timedelta
     from stockagent.agents.coordinator import run_coordinator
+    from stockagent.alerts.telegram import format_daily_summary, send_telegram, telegram_configured
+    from stockagent.data.events import refresh_corporate_actions
     from stockagent.data.market_movers import fetch_and_persist_all, confluence_flags
     from stockagent.data.nse import backfill_bhav_range, fetch_constituents
+    from stockagent.data.sectors import get_sector_map, refresh_sector_map
     from stockagent.paper_trade.ledger import process_day
     from stockagent.signals.daily import latest_trading_day_in_db
 
@@ -439,6 +449,24 @@ def daily_tick_cmd(universe: str, max_picks: int, min_conviction: float, skip_bh
     else:
         console.print("[dim]movers fetch skipped[/]")
 
+    # 2b. Refresh corporate-actions calendar (events to avoid)
+    if not skip_events:
+        console.print(f"[cyan]→ refreshing corporate-actions calendar[/]")
+        try:
+            n = refresh_corporate_actions(lookahead_days=60)
+            console.print(f"   {n} events stored")
+        except Exception as e:
+            console.print(f"[yellow]   events fetch hit issue: {e}[/]")
+
+    # 2c. Build/refresh sector map if missing (one-time per ~quarter)
+    if not get_sector_map():
+        console.print(f"[cyan]→ building sector map (one-time)[/]")
+        try:
+            m = refresh_sector_map()
+            console.print(f"   {len(m)} symbols mapped")
+        except Exception as e:
+            console.print(f"[yellow]   sector map build hit issue: {e}[/]")
+
     # 3. Paper-tick: process the latest trading day in the ledger
     latest = latest_trading_day_in_db()
     if latest is None:
@@ -452,10 +480,12 @@ def daily_tick_cmd(universe: str, max_picks: int, min_conviction: float, skip_bh
         f"open={r.open_positions}  NAV ₹{r.nav:,.0f}  day P&L ₹{r.day_pnl:+,.0f}"
     )
 
-    # 4. Generate watchlist for next-bar fills
-    console.print(f"[cyan]→ generating watchlist for next session[/]")
+    # 4. Generate watchlist for next-bar fills (multi-agent orchestrator)
+    console.print(f"[cyan]→ generating watchlist (multi-agent orchestration)[/]")
     picks = run_coordinator(
-        symbols=syms_for_decisions, as_of=latest, max_picks=max_picks, min_conviction=min_conviction
+        symbols=syms_for_decisions, as_of=latest,
+        max_picks=max_picks, min_combined_conviction=min_conviction,
+        use_llm=not no_llm, with_sentiment=not no_sentiment,
     )
     if not picks:
         console.print("[dim]   no qualifying signals.[/]")
@@ -467,15 +497,35 @@ def daily_tick_cmd(universe: str, max_picks: int, min_conviction: float, skip_bh
             total_alloc += p.position_size_inr
             flags = confluence_flags(p.symbol, latest)
             flags_line = f"   [yellow]confluence:[/] {', '.join(flags)}\n" if flags else ""
+            agent_summary = "  ".join(
+                f"{a}={v['verdict'][:3]}/{v['conviction']:.2f}" for a, v in p.per_agent.items()
+            ) if p.per_agent else ""
             console.print(
-                f"[bold]{i}. {p.symbol}[/]  ({p.strategy})\n"
+                f"[bold]{i}. {p.symbol}[/]  ({p.sector})  [{p.strategy}]\n"
                 f"   entry: ₹{p.entry:>9,.2f}   stop: ₹{p.stop:>9,.2f}   target: ₹{p.target:>9,.2f}   R:R = 1:{rr:.1f}\n"
                 f"   qty: {p.qty}    alloc: ₹{p.position_size_inr:>9,.0f}    horizon: {p.horizon_days}d\n"
-                f"   verdict: {p.verdict} (conviction {p.conviction:.2f})\n"
+                f"   verdict: {p.final_verdict} (combined conviction {p.conviction:.2f}, macro_mult {p.macro_multiplier:.2f})\n"
+                f"   agents: {agent_summary}\n"
                 f"{flags_line}"
-                f"   rationale: {p.rationale}\n"
+                f"   rationale: {p.rationale[:600]}\n"
             )
         console.print(f"[dim]Total deployed: ₹{total_alloc:,.0f} of ₹{settings.capital_inr:,.0f}[/]")
+
+    # 5. Telegram alert
+    if not no_telegram and telegram_configured():
+        console.print(f"[cyan]→ sending Telegram summary[/]")
+        msg = format_daily_summary(
+            as_of=latest, nav=r.nav, day_pnl=r.day_pnl, open_count=r.open_positions,
+            fills=r.fills,
+            exits={"stop": r.exits_stop, "signal": r.exits_signal, "time": r.exits_time},
+            picks=picks,
+        )
+        if send_telegram(msg):
+            console.print("   [green]sent[/]")
+        else:
+            console.print("   [yellow]send failed (see logs)[/]")
+    elif not no_telegram and not telegram_configured():
+        console.print("[dim]telegram not configured (set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env)[/]")
 
     console.rule("[green]daily tick complete[/]")
 
