@@ -2,7 +2,46 @@
 
 Goal: ₹5L capital, system runs unattended for 1 month, Telegram updates daily, you review results at the end.
 
-This deploys to **your local Linux machine**. The machine needs to be ON during cron times (after market close, ~16:30 IST). For true 24/7 unattended, see "Cloud option" at the end.
+## ⚡ TL;DR — Ubuntu VPS, 5 commands
+
+```bash
+# On your local machine (or wherever the repo lives):
+rsync -avz --exclude='.venv' --exclude='data/*.db' --exclude='*.bak.*' \
+    ~/projects/stockagent/ user@your-vps:~/stockagent/
+
+# On the VPS:
+ssh user@your-vps
+cd ~/stockagent
+./deploy.sh                       # interactive — prompts for API key, capital, telegram
+```
+
+That's it. The script does:
+- Installs `uv`, `cron`, `tzdata`, build essentials
+- Sets timezone to Asia/Kolkata
+- Syncs Python deps via `uv sync`
+- Builds `.env` (preserves existing values, prompts only for missing)
+- Tests OpenRouter API + Telegram bot
+- Initializes DB schema
+- Backfills 6 years of NSE bhav (~16 min, one-time)
+- Builds sector map + corp-actions calendar
+- Resets paper ledger for fresh run
+- Smoke-tests `daily-tick`
+- Installs cron jobs (daily-tick Mon-Fri 16:30 IST + weekly DB backup)
+
+After it finishes, the system runs autonomously. Wait 30 days, then `uv run stockagent paper-summary`.
+
+**Flags for re-runs / partial deploys:**
+- `--skip-backfill` — DB already has data
+- `--skip-cron` — install cron manually
+- `--non-interactive` — fail if `.env` missing values (no prompts)
+
+---
+
+## Manual deploy (if you don't want the script)
+
+The rest of this doc walks through the same steps by hand — useful for understanding what `deploy.sh` does or troubleshooting a failed run.
+
+This deploys to **your local Linux machine or VPS**. The machine needs to be ON during cron times (after market close, ~16:30 IST).
 
 ---
 
