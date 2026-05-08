@@ -264,6 +264,99 @@ uv run stockagent paper-replay --start 2024-01-01 --end 2024-06-30 --reset
 
 ---
 
+## Telegram notifications
+
+If `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set in `.env`, every weekday at 16:30 IST you receive an HTML-formatted summary message. Format below.
+
+### Typical day — new picks generated
+
+```
+📈 stockagent daily — 2026-05-12
+NAV ₹5,01,234  (+0.25% from start)
+🟢 day P&L ₹+1,234
+open: 3  fills: 2  exits: stop=0 sig=1 time=0
+
+Tomorrow's watchlist (4 picks)
+1. RELIANCE  (Energy)
+   ₹1,435.00 → stop ₹1,330.50 → tgt ₹1,644.00  R:R 1:2.0
+   qty 70  ₹100,450  conv 0.61
+2. TCS  (IT)
+   ₹2,403.20 → stop ₹2,229.65 → tgt ₹2,750.30  R:R 1:2.0
+   qty 41  ₹98,531  conv 0.58
+3. PATANJALI  (FMCG)
+   ₹529.75 → stop ₹488.48 → tgt ₹612.29  R:R 1:2.0
+   qty 188  ₹99,593  conv 0.55
+4. ZYDUSLIFE  (Pharma)
+   ₹1,034.80 → stop ₹952.40 → tgt ₹1,199.60  R:R 1:2.0
+   qty 96  ₹99,341  conv 0.52
+```
+
+### Day with no qualifying signals
+
+```
+📈 stockagent daily — 2026-05-13
+NAV ₹5,01,234  (+0.25% from start)
+🟢 day P&L ₹+0
+open: 3  fills: 0  exits: stop=0 sig=0 time=0
+
+No qualifying signals today.
+```
+
+This is normal — RSI<30 doesn't fire on every name every day, and the agent council vetoes borderline candidates.
+
+### Bad day — stop-outs hit
+
+```
+📈 stockagent daily — 2026-05-15
+NAV ₹4,89,200  (-2.16% from start)
+🔴 day P&L ₹-3,250
+open: 1  fills: 0  exits: stop=2 sig=0 time=0
+
+Tomorrow's watchlist (1 pick)
+1. INFY  (IT)
+   ₹1,152.10 → stop ₹1,037.36 → tgt ₹1,381.59  R:R 1:2.0
+   qty 86  ₹99,081  conv 0.54
+```
+
+### Field reference
+
+| Line                          | Meaning                                                                       |
+| ----------------------------- | ----------------------------------------------------------------------------- |
+| `NAV ₹X,XX,XXX (+Y.YY%)`     | Total portfolio value vs starting capital                                     |
+| `🟢 / 🔴 day P&L`            | Today's mark-to-market gain or loss in ₹                                       |
+| `open: N`                     | Currently held positions (excluding any closed today)                         |
+| `fills: N`                    | New positions opened today at market open                                     |
+| `exits: stop=X sig=Y time=Z` | Position closures: stop-loss hit, exit-signal fired, or 30-day time stop      |
+| `(Sector)`                    | Auto, Bank, FMCG, IT, Pharma, Metal, Energy, Consumer Durables, etc.          |
+| `R:R 1:2.0`                   | Risk-reward — target is 2× the stop distance from entry                       |
+| `conv 0.XX`                   | Combined conviction from the 4-agent council (0.0 to 1.0)                     |
+
+### What you do NOT receive
+
+- **Intra-day messages.** Cron runs once at 16:30 IST. No real-time alerts on open positions.
+- **Weekend messages.** Cron is Mon-Fri only.
+- **Error alerts.** Failures go to `~/stockagent/logs/daily-tick.log`. If you stop receiving Telegram messages for 2+ trading days, that's the signal to check logs.
+- **Per-fill confirmations.** Trades fill silently; the daily summary shows the count.
+- **Deep agent reasoning.** The push is concise. For full LLM reasoning per pick, run `stockagent symbol-profile --symbol XYZ` on the VPS.
+
+Expected volume: **~22 messages over a 30-day trial** (5 weekdays × ~4.4 weeks). Easy to spot anomalies by skimming.
+
+### Manual push (for spot-checks)
+
+```bash
+# Force a fresh daily-tick anytime — also re-pushes Telegram
+uv run stockagent daily-tick --skip-bhav-refresh --skip-movers
+
+# Or send a one-off message
+uv run python -c "
+import stockagent
+from stockagent.alerts.telegram import send_telegram
+send_telegram('Quick check — system alive')
+"
+```
+
+---
+
 ## Project structure
 
 ```
