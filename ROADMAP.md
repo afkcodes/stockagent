@@ -141,6 +141,36 @@ The current system is intentionally narrow: scans Nifty 500 for RSI<30 cross sig
 
 **Strict ordering principle**: every item below requires its own walk-forward before being wired into auto-trading. Discovery without validation = noise. The current Nifty 500 baseline keeps running unchanged during these additions.
 
+#### What's already in place — data plumbing is COMPLETE
+
+Before describing what to build, important framing: the data layer for non-Nifty500 stock discovery is **already shipped**. We just don't auto-trade on it yet.
+
+| Data | Stored? | Coverage | Used today for trading? |
+|---|---|---|---|
+| Daily OHLCV + delivery for all NSE EQ stocks | ✓ | 3,135 symbols, 2020-now | No — strategy bounded to Nifty 500 |
+| 7 NSE live-mover screens | ✓ daily | Top gainers/losers, volume gainers, circuit hitters | No — used for flags + manual discover |
+| Sector mapping | ✓ | All Nifty sector indices | Yes for cap, but only for Nifty 500 picks |
+| Corporate actions calendar | ✓ | Next 60 days | Yes for avoidance |
+| Fundamentals (screener.in) | ✓ on-demand | Cache-first, 60-day staleness | Yes when fundamental agent fires |
+
+**Every smallcap and midcap that ever appears in volume_gainers, top_losers, or any NSE screen ALREADY has its 6-year history in our DB.** The system has the data. What it lacks is the *strategy logic to act on it*.
+
+The exploration items below are about building strategy logic that uses this data — not about adding more data sources.
+
+**Universe coverage of each exploration item:**
+
+| Item | Universe scanned | Finds non-Nifty500 stocks? |
+|---|---|---|
+| #1 Multi-universe RSI rollout | Nifty Next 50, Midcap 150, Smallcap 250 | **Yes** — adds ~450 names beyond Nifty 500 |
+| #2 Volume-anomaly strategy | **Full NSE EQ (~3,135 symbols)** | **Yes** — designed for it |
+| #3 LLM-driven discovery | **Full NSE EQ + market movers** | **Yes** — hunts beyond any index |
+| #4 Custom screener | Full NSE EQ | **Yes** — operator-driven discovery tool |
+| #5 PEAD strategy | Full NSE EQ | **Yes** — small/midcap drift is stronger |
+| #6 Sector rotation | Sector index constituents | Partially — finds non-Nifty500 sector leaders |
+| #7 News-catalyst | Full NSE EQ (any name in scraped news) | **Yes** — catalyst-driven, universe-agnostic |
+
+**5 of 7 explicitly hunt outside Nifty 500. 2 of those (#2 and #3) are designed PRIMARILY to find non-index names.** The system goes from "Nifty 500 only" to "every NSE stock with edge worth finding."
+
 #### 1. Multi-universe RSI rollout — cheapest, fastest (~3 hours each, ~12 hr total)
 
 The same RSI mean-reversion strategy, validated on different NSE index slices:
