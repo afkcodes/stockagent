@@ -530,6 +530,118 @@ def daily_tick_cmd(universe, max_picks, min_conviction, skip_bhav_refresh, skip_
     console.rule("[green]daily tick complete[/]")
 
 
+@cli.command("telegram-init")
+@click.option("--write-env/--no-write-env", default=True, help="Write TELEGRAM_CHAT_ID into .env automatically")
+@click.option("--timeout", default=120, type=int, help="Seconds to wait for a message")
+def telegram_init_cmd(write_env: bool, timeout: int) -> None:
+    """One-time helper: discovers your Telegram chat_id by waiting for you to message the bot.
+
+    Steps:
+      1. Make sure TELEGRAM_BOT_TOKEN is in .env (from BotFather)
+      2. Run this command
+      3. Open Telegram, find your bot, send any message (e.g. "hi")
+      4. The chat_id prints here, and is written to .env
+
+    If getUpdates is consumed by a webhook, this clears it first.
+    """
+    import time
+    import requests
+    from pathlib import Path
+
+    if not settings.telegram_bot_token:
+        console.print("[red]TELEGRAM_BOT_TOKEN not set in .env[/]")
+        console.print("Get one from @BotFather on Telegram, then re-run.")
+        return
+
+    base = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
+
+    # 1. Verify bot
+    r = requests.get(f"{base}/getMe", timeout=10)
+    if r.status_code != 200:
+        console.print(f"[red]Bot token invalid:[/] HTTP {r.status_code}: {r.text[:200]}")
+        return
+    bot_info = r.json().get("result", {})
+    bot_name = bot_info.get("username", "?")
+    console.print(f"[green]✓[/] Bot reachable: @{bot_name}")
+
+    # 2. Clear any webhook so getUpdates works
+    requests.get(f"{base}/deleteWebhook", timeout=10)
+
+    # 3. Drain old updates so we only see fresh messages
+    r = requests.get(f"{base}/getUpdates?offset=-1&timeout=0", timeout=10)
+    last_id = 0
+    if r.status_code == 200:
+        results = r.json().get("result", [])
+        if results:
+            last_id = results[-1]["update_id"]
+
+    # 4. Poll for new messages
+    console.print(
+        f"\n[yellow]Now open Telegram, find @{bot_name}, send any message (e.g. 'hi').[/]"
+    )
+    console.print(f"[dim]Waiting up to {timeout}s for your message... (Ctrl+C to abort)[/]\n")
+
+    chat_id: int | None = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = requests.get(
+            f"{base}/getUpdates",
+            params={"offset": last_id + 1, "timeout": 25},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            console.print(f"[yellow]getUpdates HTTP {r.status_code}; retrying...[/]")
+            time.sleep(2)
+            continue
+        results = r.json().get("result", [])
+        for u in results:
+            last_id = max(last_id, u["update_id"])
+            msg = u.get("message") or u.get("edited_message") or {}
+            chat = msg.get("chat") or {}
+            cid = chat.get("id")
+            if cid:
+                chat_id = cid
+                first = chat.get("first_name", "")
+                console.print(f"[green]✓ Got message from {first}[/]")
+                console.print(f"[bold]TELEGRAM_CHAT_ID = {chat_id}[/]")
+                break
+        if chat_id:
+            break
+
+    if not chat_id:
+        console.print(f"\n[red]No message received in {timeout}s.[/]")
+        console.print("Make sure you sent the message TO the bot (not to yourself).")
+        return
+
+    # 5. Optional: send confirmation back
+    requests.post(
+        f"{base}/sendMessage",
+        json={"chat_id": chat_id, "text": "🔧 stockagent telegram-init OK — daily summaries will arrive here."},
+        timeout=10,
+    )
+    console.print("[green]✓[/] confirmation message sent to your chat")
+
+    # 6. Write to .env
+    if write_env:
+        env_path = Path(".env")
+        if not env_path.exists():
+            console.print(f"[yellow]No .env in {Path.cwd()} — printed value above; add it manually.[/]")
+            return
+        lines = env_path.read_text().splitlines()
+        new_lines = []
+        replaced = False
+        for line in lines:
+            if line.startswith("TELEGRAM_CHAT_ID="):
+                new_lines.append(f"TELEGRAM_CHAT_ID={chat_id}")
+                replaced = True
+            else:
+                new_lines.append(line)
+        if not replaced:
+            new_lines.append(f"TELEGRAM_CHAT_ID={chat_id}")
+        env_path.write_text("\n".join(new_lines) + "\n")
+        console.print(f"[green]✓[/] .env updated")
+
+
 @cli.command("paper-replay")
 @click.option("--start", required=True, help="ISO YYYY-MM-DD")
 @click.option("--end", default=None, help="ISO YYYY-MM-DD; defaults to latest in DB")
