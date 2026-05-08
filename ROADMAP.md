@@ -133,6 +133,69 @@ Effort: extend `data/events.py::refresh_corporate_actions` to support arbitrary 
 - **Intraday minute bars** — paid (Fyers/Kite). Only useful for an intraday strategy. We're swing — daily close is what we need. Skip.
 - **Tick-by-tick data** — institutional-grade. Would cost ₹5K-50K/month. Way overkill for personal-use swing trading. Skip.
 
+### Tier 2 (USER-REQUESTED 2026-05-09)
+
+#### Interactive Telegram bot — on-demand analysis (~4-6 hours)
+
+User sends a stock symbol or command to the bot; it runs the full agent council and replies with the verdict + chart in Telegram.
+
+**Commands to support:**
+- `/analyze RELIANCE` → full 4-agent verdict (technical, fundamental, sentiment, macro) with chart image attached
+- `/status` → current portfolio NAV, open positions, today's P&L
+- `/watchlist` → most recent watchlist
+- `/profile RELIANCE` → system's track record on this symbol (uses `symbol-profile`)
+- `/discover` → market-movers discovery (non-Nifty500 names with action today)
+
+**Architecture change required:** this can't run on cron alone — it needs a long-running poller (or webhook). Two options:
+- **Polling (simpler):** systemd service running `python -m stockagent.alerts.telegram_bot` that long-polls `getUpdates`. Survives restarts via systemd. ~1 hour to wire.
+- **Webhook (cleaner):** requires HTTPS endpoint on the VPS (Caddy/Nginx + cert). Telegram pushes updates to it. ~3 hours setup but lighter on the bot's CPU.
+
+**Real value:** during the trial month you'd spot-check a name without SSHing in. Post-trial, becomes the daily interaction model.
+
+**Risk:** introduces a stateful service. Cron-only is currently fully stateless — easy to debug. A bot service can hang, drift, or get into weird states. Mitigate with health-check ping every 5 min + auto-restart via systemd.
+
+**Recommendation:** build AFTER the 1-month trial completes. The trial period should be measuring strategy edge, not new infrastructure.
+
+#### Alternative data sources for stock discovery (~varies, mostly speculative)
+
+Looking beyond NSE bhav for stock-finding signals.
+
+| Source | Type | Useful for | Effort | Honest take |
+|---|---|---|---|---|
+| **Groww** | Retail platform | Trending stocks, social sentiment | 2-3 hrs scraping | No transformative unique data — Groww re-publishes NSE data with retail-flow tracking. Marginal. |
+| **Tickertape** | Aggregator | Custom screeners, scorecards, peer compare | 3-4 hrs | Their scoring is opinionated but reasonable; worth scraping the screener. |
+| **Stockedge** | Aggregator | Earnings transcripts (paid), shareholding pattern | 4-6 hrs | Free tier limited; main value is shareholding history we don't have. |
+| **Smallcase** | Thematic baskets | Theme-based discovery | 2-3 hrs | Mostly marketing-driven baskets; not edge data. |
+| **Screener.in screeners** | Custom filter | Pre-built screens by community | 2 hrs | Already scrape fundamentals from screener; could add their public-screens API. Low effort, real value. |
+
+**Reality check:** the walk-forward already showed broader universe (liquid filter past Nifty 500) HURT mean-reversion edge. The bottleneck on returns is probably not "we need more candidates" — it's "we need higher-quality filtering of our existing candidates." More data sources without quality filters is more noise, not more signal.
+
+**Prioritized recommendation:**
+1. Build a CUSTOM SCREENER from our own DB first (~2 hours). We already have prices + delivery + fundamentals + sectors + market-movers. A `stockagent screen --rsi-below 30 --roe-min 12 --debt-equity-max 0.5 --avg-volume-min 1000000` command would surface stocks no third-party screener gives us, using data we already trust.
+2. THEN add Tickertape (or screener.in's screens) if the in-house screener leaves gaps.
+3. Skip Groww and Smallcase unless a specific signal idea emerges.
+
+**Effort:** custom screener ~2 hours; per external source ~3-4 hours.
+
+#### Zerodha Kite Connect — real trading rail (already Tier 3, restating gate)
+
+Already in Tier 3 below. Restating the gate explicitly:
+
+**Hard preconditions before integration starts:**
+1. Minimum **30 trading days** of clean paper-trade history via `daily-tick` cron
+2. **`paper-summary` shows positive total return** AND median per-window Sharpe positive (consistent with walk-forward expectations of +0.69)
+3. **No major bug fixes in the strategy or agents** during the trial — we want to validate the SAME code that ran for 30 days
+4. **Manual review of every closed trade** for at least the first 2 weeks of paper trading — you should be able to defend each pick before trusting the system with capital
+
+If all four conditions are met, then:
+- Open Zerodha account (or use your existing)
+- ₹500/month Kite Connect subscription
+- 1-2 days of integration work (auth flow, order placement, reconciliation)
+- **Start at HALF position size** — ₹50K instead of ₹1L per stock — for the first 30 days of live trading
+- Run paper trading IN PARALLEL as a control for the first 60 days of live
+
+This is non-negotiable. Premature live deployment is the highest-risk move possible.
+
 ### Tier 2 — Build later (medium impact or higher complexity)
 
 #### 6. Sentiment/news agent on held positions (~3-4 hours)
