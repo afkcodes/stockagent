@@ -152,6 +152,44 @@ class BollingerBreakoutFiltered(BollingerBreakout):
         return StrategySignals(entry=base.entry & gate, exit=base.exit, stop_price=base.stop_price)
 
 
+class RsiMeanReversionMTF(RsiMeanReversion):
+    """RSI mean-reversion with WEEKLY trend confirmation.
+
+    Daily entry fires only when weekly RSI(14) > 40 — i.e., the larger trend isn't
+    deeply bearish. This is a multi-timeframe filter, NOT the (failed) trend filter
+    that hurt mean-reversion. Weekly RSI > 40 still allows pullbacks.
+    """
+
+    name = "rsi_mean_reversion_mtf"
+
+    def __init__(self, oversold: int = 30, overbought: int = 60, atr_mult: float = 3.0,
+                 weekly_rsi_min: float = 40.0):
+        super().__init__(oversold=oversold, overbought=overbought, atr_mult=atr_mult)
+        self.weekly_rsi_min = weekly_rsi_min
+        self.indicators = ("rsi14", "atr14")
+
+    def signals(self, df: pd.DataFrame) -> StrategySignals:
+        base = super().signals(df)
+        # Compute weekly RSI from daily closes
+        weekly_close = df["close"].resample("W-FRI").last().dropna()
+        if len(weekly_close) < 20:
+            return StrategySignals(
+                entry=pd.Series(False, index=df.index), exit=base.exit, stop_price=base.stop_price
+            )
+        import pandas_ta as ta
+        weekly_rsi = ta.rsi(weekly_close, length=14)
+        if weekly_rsi is None:
+            return StrategySignals(
+                entry=pd.Series(False, index=df.index), exit=base.exit, stop_price=base.stop_price
+            )
+        # Forward-fill weekly RSI onto daily index, then test threshold
+        weekly_rsi_daily = weekly_rsi.reindex(df.index, method="ffill")
+        gate = (weekly_rsi_daily > self.weekly_rsi_min).fillna(False)
+        return StrategySignals(
+            entry=base.entry & gate, exit=base.exit, stop_price=base.stop_price,
+        )
+
+
 class DeliveryAnomaly(Strategy):
     """Buy when delivery-pct spikes to unusually high vs its 60-day baseline,
     on a positive close. Premise: institutional accumulation tells.
@@ -192,4 +230,5 @@ STRATEGIES: dict[str, type[Strategy]] = {
     "rsi_mean_reversion_filtered": RsiMeanReversionFiltered,
     "bollinger_breakout_filtered": BollingerBreakoutFiltered,
     "delivery_anomaly": DeliveryAnomaly,
+    "rsi_mean_reversion_mtf": RsiMeanReversionMTF,
 }

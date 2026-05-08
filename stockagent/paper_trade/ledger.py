@@ -31,6 +31,33 @@ from stockagent.db.session import get_engine
 _TIME_STOP_DAYS = 30  # max holding period if neither stop nor target hit
 _RSI_EXIT = 60        # mean-reversion exit threshold (matches strategies.py)
 
+# Trailing stop config
+_TRAIL_TRIGGER_PCT = 0.05   # activate trailing after position is up >+5%
+_TRAIL_ATR_MULT = 1.5       # trailing distance = 1.5 × ATR(14)
+
+
+def _trailing_stop_for(symbol: str, d: date, current_close: float, current_stop: float) -> float:
+    """Return the BETTER of (current_stop, trailing_stop_today). Stops only RATCHET UP.
+
+    Trailing rule: if position is up >5% from entry, set stop = max(current_stop,
+    current_close - 1.5 × ATR(14)). Locks in profit while letting winners run.
+    """
+    end_ts = pd.Timestamp(d)
+    start = end_ts - pd.Timedelta(days=80)
+    df = load_prices(symbol, start=start.date(), end=d)
+    if df.empty:
+        return current_stop
+    df = df.droplevel("symbol").sort_index()
+    from stockagent.indicators.compute import add_indicators
+    df = add_indicators(df, ["atr14"])
+    if df.empty or pd.isna(df["atr14"].iloc[-1]):
+        return current_stop
+    atr = float(df["atr14"].iloc[-1])
+    if not math.isfinite(atr) or atr <= 0:
+        return current_stop
+    candidate = current_close - _TRAIL_ATR_MULT * atr
+    return max(current_stop, candidate)  # never lower the stop
+
 
 @dataclass
 class TickResult:
@@ -277,9 +304,19 @@ def process_day(d: date, *, costs: CostModel | None = None, generate_today: bool
 
         exit_reason = None
         exit_fill = None
+        # Trailing-stop adjustment: if position is up >5%, ratchet stop up.
+        if stop is not None and math.isfinite(stop):
+            unrealized_pct = (close_px - pos["entry_price"]) / pos["entry_price"]
+            if unrealized_pct >= _TRAIL_TRIGGER_PCT:
+                new_stop = _trailing_stop_for(sym, d, close_px, stop)
+                if new_stop > stop:
+                    with engine.begin() as cc:
+                        cc.execute(text("UPDATE coordinator_decisions SET stop_loss = :s WHERE id = :id"),
+                                   {"s": new_stop, "id": pos["decision_id"]})
+                    stop = new_stop
         if stop is not None and math.isfinite(stop) and low <= stop:
             exit_fill = costs.slip_sell(min(open_px, stop))
-            exit_reason = "stop"
+            exit_reason = "stop"  # could be original stop or trailing stop — both labelled 'stop'
         elif days_held >= _TIME_STOP_DAYS:
             exit_fill = costs.slip_sell(close_px)
             exit_reason = "time"
