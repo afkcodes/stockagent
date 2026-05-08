@@ -6,12 +6,21 @@ Your reference for what to do, in priority order.
 
 ## ⚠️ Do this now (one-time)
 
-**Update `.env`** — change the model lines so the LLM agent actually works:
+**Update `.env`** — recommend gemini-3-flash-preview for ALL agents (it's the multimodal model verified to work for our pipeline). Set every agent's model:
 ```
 MODEL_TECHNICAL=google/gemini-3-flash-preview
+MODEL_FUNDAMENTAL=google/gemini-3-flash-preview
+MODEL_SENTIMENT=google/gemini-3-flash-preview
+MODEL_MACRO=google/gemini-3-flash-preview
 MODEL_COORDINATOR=google/gemini-3-flash-preview
 ```
-The current `moonshotai/kimi-k2.5` returns empty content on our long multimodal prompts. Gemini 3 flash preview is verified working: 2.7s/call, ~$0.0007/call (~₹0.06).
+The previous `moonshotai/kimi-k2.5` returns empty content on long multimodal prompts. Gemini 3 flash preview: 2.7s/call, ~$0.0007/call. With 4 agents per pick × 5 picks/day × 365 = ~7,300 calls/year ≈ ₹450/year. Effectively free.
+
+**Optional but recommended:** set up Telegram for daily push notifications.
+```
+TELEGRAM_BOT_TOKEN=...   # from @BotFather
+TELEGRAM_CHAT_ID=...     # from https://api.telegram.org/bot<TOKEN>/getUpdates after sending the bot any message
+```
 
 After saving `.env`, sanity-check:
 ```

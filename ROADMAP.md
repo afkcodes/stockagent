@@ -4,6 +4,8 @@ What's built, what's missing, and what would actually move the needle on profita
 
 This is a living doc. The system runs end-to-end today; everything below is *enhancement*, not "fix the broken part." Honest impact estimates included.
 
+> **2026-05-09 update:** the V2 multi-agent council, risk features, and Telegram alerts are now SHIPPED. See "What's built" updated below; Tier 1 of the original roadmap is fully done. Open items: dashboard, parameter sweeps, PEAD strategy.
+
 ---
 
 ## Part 1 — What's built (operational today)
@@ -61,7 +63,18 @@ These were in the original phased plan (memory) but didn't get built. Each has a
 
 This is the ordered list of what would most likely improve real-money returns. Effort estimates assume current architecture.
 
-### Tier 1 — Build these next (high impact, ≤4 hours each)
+### ✅ Tier 1 — DONE 2026-05-09
+
+All five Tier 1 items shipped this session:
+- **Sector concentration cap** ✓ `data/sectors.py` + coordinator V2 enforces `max_picks_per_sector=2`
+- **Earnings/corporate-action avoidance** ✓ `data/events.py` filters signals within ±5 trading days of any event
+- **Fundamental agent** ✓ `data/screener.py` + `agents/fundamental.py` — quality gate with mechanical vetoes
+- **Trailing stops** ✓ `paper_trade/ledger.py` — ratchets stop up at >+5% unrealized
+- **Telegram alerts** ✓ `alerts/telegram.py` — push daily summary if configured
+
+Plus bonus: full multi-agent orchestration framework (4 agents, parallel, formula combine).
+
+### Tier 1 (original — kept for history)
 
 #### 1. Sector concentration cap (~1 hour)
 **Problem:** 5 picks today could all be NBFCs in a Nifty PSU rally. When the sector rolls over, all 5 stop out simultaneously. Single-day -25% drawdown possible from concentration alone.
