@@ -171,6 +171,112 @@ The exploration items below are about building strategy logic that uses this dat
 
 **5 of 7 explicitly hunt outside Nifty 500. 2 of those (#2 and #3) are designed PRIMARILY to find non-index names.** The system goes from "Nifty 500 only" to "every NSE stock with edge worth finding."
 
+#### Current vs post-exploration architecture (visual)
+
+**Today (single-strategy, single-universe):**
+
+```
+Daily 16:30 IST
+      │
+      ▼
+┌───────────────┐    ┌──────────────────┐    ┌──────────────────────┐
+│ Bhav refresh  │──▶ │ Generate signals │──▶ │ Filter (event window)│
+│ (full NSE EQ) │    │ (Nifty 500 only) │    │ + Agent council      │
+└───────────────┘    │ RSI<30 cross     │    │ + Sector cap         │
+                     └──────────────────┘    │ + Macro multiplier   │
+                                             │ + Position sizing    │
+                                             └──────────┬───────────┘
+                                                        │
+                                                        ▼
+                                                  ranked picks
+                                                  → paper ledger
+                                                  → Telegram
+
+Market movers fetched but only feed:
+   - confluence flags on existing picks
+   - manual `discover` command (operator only)
+```
+
+**After Sprints 1-4 of exploration buildout:**
+
+```
+Daily 16:30 IST
+      │
+      ▼
+┌───────────────┐
+│ Bhav refresh  │
+│ + movers fetch│
+│ + sector data │
+└───────┬───────┘
+        │
+        ├──▶ ┌─────────────────────────────────┐
+        │    │ Strategy 1: RSI mean-reversion  │
+        │    │ (Nifty 500, proven)             │
+        │    └─────────────┬───────────────────┘
+        │                  │
+        ├──▶ ┌─────────────────────────────────┐
+        │    │ Strategy 2: Multi-universe RSI  │
+        │    │ (Next 50, Midcap 150)           │
+        │    └─────────────┬───────────────────┘
+        │                  │
+        ├──▶ ┌─────────────────────────────────┐
+        │    │ Strategy 3: Volume-anomaly      │
+        │    │ (full NSE EQ, smallcap-friendly)│
+        │    └─────────────┬───────────────────┘
+        │                  │
+        ├──▶ ┌─────────────────────────────────┐
+        │    │ Strategy 4: PEAD earnings drift │
+        │    │ (full NSE EQ, post-results)     │
+        │    └─────────────┬───────────────────┘
+        │                  │
+        └──▶ ┌─────────────────────────────────┐
+             │ LLM Discovery Agent             │
+             │ (movers + macro + news → picks) │
+             └─────────────┬───────────────────┘
+                           │
+                           ▼
+             ┌───────────────────────────────┐
+             │ All candidates → SAME 4-agent │
+             │ council (technical, fundamental,│
+             │ sentiment, macro). Same vetoes,│
+             │ same combine formula.         │
+             └─────────────┬─────────────────┘
+                           │
+                           ▼
+             ┌───────────────────────────────┐
+             │ Cross-strategy ranking +      │
+             │ sector cap + macro multiplier │
+             │ + position sizing locks       │
+             └─────────────┬─────────────────┘
+                           │
+                           ▼
+                    ranked picks across
+                    full NSE EQ universe
+                    → paper ledger
+                    → Telegram
+```
+
+The architectural insight: **the agent council and risk infrastructure are universe-agnostic by design**. Adding a new strategy means adding a new candidate source — the validation, sizing, and risk caps that follow are unchanged. The expansion is mostly *strategy logic*, not infrastructure.
+
+#### What we deferred and why (honest retrospective)
+
+The natural question: "we should have built this from the start." Half-right. Here's the honest accounting:
+
+**Built first (correctly):**
+- Full NSE EQ data backfill (~3,135 stocks, 6 years) — ✓ shipped
+- Market-movers fetcher + storage — ✓ shipped
+- Discovery CLI (`market-movers discover`) — ✓ shipped, manual only
+- Multi-agent council that's universe-agnostic — ✓ shipped
+- Walk-forward framework — ✓ shipped
+
+**Deferred (correctly, with a caveat):**
+- **Strategy logic to AUTO-trade non-Nifty500 names.** Reason: walk-forward proved the existing strategy (RSI mean-reversion) gets WORSE on broader universes. Building auto-trade-on-discovery without a validated discovery strategy would have shipped a system that loses money. The discipline of "validate before deploy" was the right call.
+
+**Caveat (the "we should have done it" part):**
+- We could have built a "discovery-only" auto-mode that surfaces non-Nifty500 candidates as a *parallel watchlist* (not auto-traded, just observed) — letting the operator see WHAT the system would have considered. We didn't, and adding it now to the buildout is cheap (~2 hours, basically wiring `market-movers discover` into the daily Telegram push).
+
+So: the gap is real and the user's instinct was right. But the gap was structurally shallower than it appears — most of the work was already done. Sprint 1 of the exploration buildout completes it.
+
 #### 1. Multi-universe RSI rollout — cheapest, fastest (~3 hours each, ~12 hr total)
 
 The same RSI mean-reversion strategy, validated on different NSE index slices:
