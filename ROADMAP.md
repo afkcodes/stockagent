@@ -133,6 +133,164 @@ Effort: extend `data/events.py::refresh_corporate_actions` to support arbitrary 
 - **Intraday minute bars** — paid (Fyers/Kite). Only useful for an intraday strategy. We're swing — daily close is what we need. Skip.
 - **Tick-by-tick data** — institutional-grade. Would cost ₹5K-50K/month. Way overkill for personal-use swing trading. Skip.
 
+### Tier 2: TRUE EXPLORATION — broader stock discovery (USER-REQUESTED 2026-05-10)
+
+The current system is intentionally narrow: scans Nifty 500 for RSI<30 cross signals daily. Walk-forward justified that narrowness for the proven strategy. But it's **not real exploration** — it reacts to one specific event in one fixed universe, missing the multibagger smallcap and the breakout midcap entirely.
+
+**This section is the plan to fix that** — turning the system from a narrow rule-firer into a real explorer that hunts across the whole NSE.
+
+**Strict ordering principle**: every item below requires its own walk-forward before being wired into auto-trading. Discovery without validation = noise. The current Nifty 500 baseline keeps running unchanged during these additions.
+
+#### 1. Multi-universe RSI rollout — cheapest, fastest (~3 hours each, ~12 hr total)
+
+The same RSI mean-reversion strategy, validated on different NSE index slices:
+
+| Slice | Names | Existing in nselib | Hypothesis |
+|---|---|---|---|
+| **Nifty Next 50** | 50 | ✓ | Higher-growth largecaps, may have more inefficiency than Nifty 50 |
+| **Nifty Midcap 150** | 150 | ✓ | The actual midcap pool — likely WORKS but Sharpe profile probably noisier |
+| **Nifty Smallcap 250** | 250 | ✓ | More inefficient but lower-quality on average |
+| **Nifty Microcap 250** | 250 | ✓ | High-risk frontier; expect catastrophic gaps |
+
+Build:
+- `fetch_constituents()` already supports these names
+- Run walk-forward on each; adopt only those with median Sharpe ≥ +0.4 AND ≥75% positive windows
+- Each surviving slice gets its own line in `VIABLE_STRATEGIES` registry as a separate strategy variant
+- Coordinator runs ALL viable strategies daily; signals from different universes ROUTE through the same agent council (technical agent already universe-agnostic, fundamental adds quality vetoes)
+
+This is the lowest-risk expansion. Possible outcome: Midcap 150 also works → universe roughly doubles.
+
+#### 2. Volume-anomaly discovery strategy (~6-8 hours + walk-forward)
+
+A NEW strategy concept that explicitly hunts for stocks the universe-based scan misses:
+
+**Hypothesis:** when a stock has unusual volume + delivery + price-up day, that's institutional accumulation. Buy it before it moves, exit on volume normalization or stop-loss.
+
+**Detection rule (mechanical):**
+- Volume today > 3× 60-day average
+- Delivery % > 60-day mean + 2 stdev
+- Close > prior close
+- Stock not currently in Nifty 500 (so it's "discovered" — not redundant with main strategy)
+
+**Agent council additions:**
+- Liquidity check (is this even tradeable for ₹1L positions?)
+- Quick fundamental veto (is this a Z-group / SME / penny stock?)
+- News scan (was this driven by a specific event we should know about?)
+
+**Walk-forward gate:** must pass median Sharpe ≥ +0.5, ≥70% positive windows on full NSE EQ universe over 2020-2026. If it fails, it stays as a discovery layer (surfaces names for manual review) but doesn't auto-trade.
+
+This is the MOST aligned with "exploration that finds new stocks" — it's literally designed to surface non-index names.
+
+#### 3. LLM-driven discovery agent (~8-12 hours)
+
+A NEW agent that doesn't react to deterministic signals but actively HUNTS.
+
+**Mechanism:**
+- Daily after market close, receive: market-movers data, macro snapshot, sector strength matrix, FII/DII flows
+- LLM is asked: "Given today's market, identify 5-10 stocks NOT in our current watchlist or Nifty 500 that look like high-conviction setups for a 1-3 week swing trade. Cite specific reasons."
+- Each LLM-suggested name is then passed through the existing 4-agent council for full evaluation
+- Survivors qualify for the watchlist alongside the deterministic-strategy picks
+
+**Why this is interesting:**
+- LLMs can recognize patterns in news + sector rotation + macro context that no single rule captures
+- Adds qualitative judgment to discovery without bypassing our quantitative validation (every LLM suggestion still passes the agent council and walk-forward-style risk checks)
+
+**Risk:** LLM hallucinations. Mitigation: every suggestion must be confirmable from data we have (volume spike, delivery anomaly, gap-up). LLM provides the framing, data confirms or rejects.
+
+**Cost:** one extra LLM call/day at ~₹0.10. Nothing.
+
+**Walk-forward complication:** can't backtest LLM-driven discovery in the traditional sense (responses are non-deterministic). Solution: parallel paper-trade for 2 months alongside the deterministic strategy, compare hit rates.
+
+#### 4. Custom multi-criteria screener — power tool for the operator (~2 hours)
+
+```bash
+stockagent screen \
+  --avg-turnover-cr 3       \  # liquid enough for ₹1L positions
+  --avg-price-min 50        \  # not a penny stock
+  --rsi-below 35            \  # showing pullback
+  --debt-equity-max 0.6     \  # quality leverage
+  --roe-min 12              \  # growing business
+  --delivery-pct-min 50     \  # institutional interest
+  --not-in-nifty500            # exclude what we already track
+```
+
+This combines our existing data (prices + delivery + fundamentals + sectors) into a single command. Lets you discover ad-hoc — "show me oversold quality midcaps with high delivery this week" — using data we already trust.
+
+Doesn't auto-feed the trading system. Discovery only. Operator picks ideas to research further.
+
+#### 5. PEAD / earnings-momentum strategy (~10-15 hours, prerequisite work in Tier 1.5)
+
+Already noted but explicitly part of exploration: post-earnings-announcement drift on full NSE universe.
+
+**Why this is exploration**: earnings beats happen across all market caps. PEAD historically shows STRONGER signal in midcaps and smallcaps than largecaps (less analyst coverage = more drift before efficient repricing).
+
+**Prerequisite (per Tier 1.5):** quarterly earnings results history scrape (~3-4 hours). Without this, no PEAD strategy possible.
+
+**Hard validation gate:** walk-forward on full NSE EQ universe. If median Sharpe ≥ +0.6 with positive windows ≥75%, register in VIABLE_STRATEGIES.
+
+#### 6. Sector-rotation discovery (~4-6 hours)
+
+Each Nifty sector index has its own trend. When a sector is breaking out (e.g., Pharma index up >5% in 2 weeks while Nifty 50 flat), the LEADING stocks in that sector often run further. This is a separate signal from RSI mean-reversion.
+
+**Detection:**
+- Compute 20-day relative strength of each sector index vs Nifty 50
+- Top 2 sectors → scan their constituents for breakouts (close > 20-day high on volume)
+- Run candidates through agent council
+
+This finds stocks no individual-stock signal would catch — they're picked because their SECTOR is moving, not because their CHART says oversold.
+
+#### 7. News/event-catalyst discovery (~8-10 hours)
+
+Scan financial news (we already have Moneycontrol + Google News scrapers) for catalyst keywords:
+- Major contract wins
+- Approvals (FDA, regulatory)
+- Order book updates
+- Capacity expansions
+- Sector tailwinds
+
+When a catalyst headline mentions a stock, run the agent council to evaluate it as a swing-trade candidate.
+
+**Risk:** news is delayed by definition — by the time it's on Moneycontrol, retail is buying. Mitigation: only act if other signals (volume, delivery) confirm.
+
+### Honest priority ordering for exploration
+
+If we're going to add exploration, the order that maximizes ROI per hour:
+
+1. **Multi-universe RSI rollout (#1)** — proven strategy on bigger pool. Expected to expand the universe by 2-3× cheaply. Walk-forward likely to validate at least Nifty Next 50 and Nifty Midcap 150.
+2. **Custom screener (#4)** — operator power tool, complements everything else, ships in an afternoon.
+3. **Volume-anomaly strategy (#2)** — first NEW strategy designed for discovery. If walk-forward validates, this finds non-index names systematically.
+4. **PEAD (#5) + earnings history (Tier 1.5)** — earnings drift specifically rewards smaller caps with less coverage; this is where the multibagger discovery happens.
+5. **LLM-driven discovery agent (#3)** — qualitative layer once quantitative stack proves sound.
+6. **Sector rotation (#6)** — different signal class, fills a gap.
+7. **News-catalyst (#7)** — last priority, retail-late by nature.
+
+### Hard ground rules during exploration buildout
+
+These don't change:
+
+- **Trial month runs unchanged.** Adding any of these mid-trial invalidates the data.
+- **Every new strategy passes walk-forward before auto-trading.** Median Sharpe ≥ +0.4, ≥75% positive windows.
+- **Discovery without validation is for the operator's manual review only.** Doesn't auto-deploy capital.
+- **Risk caps still apply.** All locked rules (₹1L/20%/5%, sector cap, macro multiplier) apply across ALL strategies.
+
+### What this section commits us to
+
+After the 1-month trial completes with positive validation, we build in this order:
+
+**Sprint 1 (~15 hours):** Multi-universe RSI rollout + custom screener. Likely outcome: universe expands to Nifty 500 + Nifty Midcap 150 + Nifty Next 50 (~700 names total). Operator has a screener tool.
+
+**Sprint 2 (~10 hours):** Volume-anomaly discovery strategy. Walk-forward validation. If passes, register and watch live.
+
+**Sprint 3 (~15 hours):** Earnings history backfill + PEAD strategy. Walk-forward validation on full NSE universe.
+
+**Sprint 4 (~10 hours):** LLM-driven discovery agent. Parallel paper trade alongside deterministic.
+
+**Sprints 5-6 (~12 hours):** Sector rotation + news catalyst.
+
+Total exploration buildout: ~60 hours. Spread across 2-3 months post-trial. By that point we'd have a system that scans the entire NSE EQ universe through 4-6 different lenses, with every signal validated by walk-forward and risk-managed by the same agent council.
+
+That's actual exploration. The current single-strategy single-universe setup is the launchpad, not the destination.
+
 ### Tier 2 (USER-REQUESTED 2026-05-09)
 
 #### Interactive Telegram bot — on-demand analysis (~4-6 hours)
