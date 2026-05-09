@@ -139,29 +139,29 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
     light_grey = (220, 220, 220)
     pnl_color = (16, 124, 16) if day_pnl >= 0 else (192, 32, 32)
 
-    title_font = _find_font(20, bold=True)
-    section_font = _find_font(14, bold=True)
-    header_font = _find_font(12, bold=True)
-    body_font = _find_font(12, mono=True)
-    body_bold = _find_font(13, mono=True, bold=True)
+    title_font = _find_font(16, bold=True)
+    section_font = _find_font(12, bold=True)
+    header_font = _find_font(10, bold=True)
+    body_font = _find_font(10, mono=True)
+    body_bold = _find_font(11, mono=True, bold=True)
 
-    pad = 22
-    line_h = 22
-    row_h = 26
+    pad = 14
+    line_h = 17
+    row_h = 20
 
-    # Column layout — (header, width_px, align)
+    # Column layout — (header, width_px, align). Tightened for compactness.
     cols = [
-        ("#",        30,  "right"),
-        ("Symbol",  120,  "left"),
-        ("Sector",   90,  "left"),
-        ("Entry",    95,  "right"),
-        ("Stop",     95,  "right"),
-        ("Target",   95,  "right"),
-        ("Qty",      55,  "right"),
-        ("Alloc Rs",100,  "right"),
-        ("Conv",     55,  "right"),
+        ("#",       22, "right"),
+        ("Symbol",  92, "left"),
+        ("Sector",  70, "left"),
+        ("Entry",   70, "right"),
+        ("Stop",    70, "right"),
+        ("Target",  70, "right"),
+        ("Qty",     42, "right"),
+        ("Alloc",   72, "right"),
+        ("Conv",    42, "right"),
     ]
-    col_gap = 12
+    col_gap = 8
     table_width = sum(w for _, w, _ in cols) + col_gap * (len(cols) - 1)
     width = pad * 2 + table_width
 
@@ -186,9 +186,9 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
         draw.text((tx, y), text, fill=color, font=font)
 
     # Compute total height
-    header_h = pad + line_h * 4 + 16  # title + 3 summary lines + bottom margin
+    header_h = pad + line_h * 4 + 10  # title + 3 summary lines + bottom margin
     if picks:
-        body_h = line_h + 8 + row_h + 4 + len(picks) * row_h + pad
+        body_h = line_h + 4 + row_h + 4 + len(picks) * row_h + pad
     else:
         body_h = line_h + pad
     height = header_h + body_h
@@ -199,18 +199,17 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
     # ─── Top: title + summary block ──────────────────────────────────────
     y = pad
     draw.text((pad, y), f"stockagent daily  -  {as_of}", fill=black, font=title_font)
-    y += line_h + 6
-    draw.text((pad, y), f"NAV  Rs {nav:>13,.0f}    ({ret_pct:+.2f}% from start)",
+    y += line_h + 4
+    draw.text((pad, y), f"NAV  Rs {nav:>11,.0f}    ({ret_pct:+.2f}% from start)",
               fill=black, font=body_font)
     y += line_h
-    draw.text((pad, y), f"Day P&L  Rs {day_pnl:>+13,.0f}",
+    draw.text((pad, y), f"Day P&L  Rs {day_pnl:>+11,.0f}",
               fill=pnl_color, font=body_bold)
     y += line_h
     draw.text((pad, y),
-              f"Open: {open_count}   Fills: {fills}   "
-              f"Exits  stop:{exits.get('stop',0)}  signal:{exits.get('signal',0)}  time:{exits.get('time',0)}",
+              f"Open:{open_count}  Fills:{fills}  Exits  stop:{exits.get('stop',0)}  signal:{exits.get('signal',0)}  time:{exits.get('time',0)}",
               fill=grey, font=body_font)
-    y += line_h + 12
+    y += line_h + 8
 
     if not picks:
         draw.text((pad, y), "No qualifying signals today.", fill=grey, font=body_font)
@@ -221,7 +220,7 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
     # ─── Section title + table ────────────────────────────────────────────
     draw.text((pad, y), f"Tomorrow's watchlist  ({len(picks)} picks)",
               fill=black, font=section_font)
-    y += line_h + 8
+    y += line_h + 4
 
     # Table header row
     for (header, _, _), (x_start, x_end, align) in zip(cols, col_ranges):
