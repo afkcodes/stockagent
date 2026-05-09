@@ -513,16 +513,16 @@ def daily_tick_cmd(universe, max_picks, min_conviction, skip_bhav_refresh, skip_
             )
         console.print(f"[dim]Total deployed: ₹{total_alloc:,.0f} of ₹{settings.capital_inr:,.0f}[/]")
 
-    # 5. Telegram alert
+    # 5. Telegram alert (image; falls back to text on any failure)
     if not no_telegram and telegram_configured():
-        console.print(f"[cyan]→ sending Telegram summary[/]")
-        msg = format_daily_summary(
+        from stockagent.alerts.telegram import send_daily_summary
+        console.print(f"[cyan]→ sending Telegram summary (image)[/]")
+        if send_daily_summary(
             as_of=latest, nav=r.nav, day_pnl=r.day_pnl, open_count=r.open_positions,
             fills=r.fills,
             exits={"stop": r.exits_stop, "signal": r.exits_signal, "time": r.exits_time},
             picks=picks,
-        )
-        if send_telegram(msg):
+        ):
             console.print("   [green]sent[/]")
         else:
             console.print("   [yellow]send failed (see logs)[/]")
