@@ -45,20 +45,34 @@ for host in ["nseindia.com", "www.nseindia.com", "nsearchives.nseindia.com"]:
         print(f"  {host:35s} → FAIL: {e}")
 
 
-# 2. Raw HTTPS to NSE
-section("2. Raw TCP/HTTPS to NSE (3 calls each)")
-for url in ["https://nseindia.com/", "https://nsearchives.nseindia.com/"]:
+# 2. Raw HTTPS to NSE — use real paths, NOT bare hostnames.
+# The bare https://nsearchives.nseindia.com/ has no default page (Akamai returns
+# nothing) so it always times out — even when the actual archive paths work fine.
+# Test paths nselib actually hits.
+section("2. Raw TCP/HTTPS to NSE (real archive paths, 3 calls each)")
+test_urls = [
+    "https://www.nseindia.com/",
+    "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_03052024.csv",
+]
+for url in test_urls:
     times = []
     for i in range(3):
         t = time.time()
         try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            r = requests.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": "https://www.nseindia.com/",
+                },
+                timeout=15,
+            )
             times.append(time.time() - t)
         except Exception as e:
-            print(f"  {url} attempt {i+1}: FAIL {e}")
+            print(f"  {url[:60]:60s} attempt {i+1}: FAIL {str(e)[:80]}")
     if times:
         avg = sum(times) / len(times) * 1000
-        print(f"  {url:50s} avg {avg:>6.0f}ms")
+        print(f"  {url[:60]:60s} avg {avg:>6.0f}ms")
 
 
 # 3. Single bhav call timing — the actual bottleneck of the backfill
