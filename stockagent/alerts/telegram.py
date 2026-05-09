@@ -136,7 +136,8 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
     each glyph has 4x the pixels, giving sharp anti-aliased rendering."""
     from PIL import Image, ImageDraw
 
-    SCALE = 3  # bump pixel density without changing logical layout
+    SCALE = 1  # 1 = compact native size (642x251 for 5 picks)
+               # bump to 2-3 for higher pixel density at the cost of larger display
 
     starting = settings.capital_inr
     ret_pct = (nav - starting) / starting * 100
