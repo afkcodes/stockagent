@@ -25,7 +25,7 @@ from sqlalchemy import text
 
 # Use a window safely far in the past so it's idempotent and won't conflict
 # with any "current" rows we've already loaded.
-TEST_DAYS = 15  # number of trading days per probe (≈3 weeks)
+TEST_DAYS = 5  # trading days per probe — small window for quick iteration
 SLEEP_VALUES = [0.2, 0.7, 1.5]  # the three sleep_sec settings to compare
 
 
