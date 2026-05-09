@@ -271,25 +271,51 @@ uv run stockagent init-db | tail -3
 ok "DB ready"
 
 # ─── 9. Historical backfill ──────────────────────────────────────────────────
-ROW_COUNT=$(uv run python -c "
+DB_STATUS=$(uv run python -c "
 import stockagent
 from sqlalchemy import text
 from stockagent.db.session import get_engine
 with get_engine().connect() as c:
-    print(c.execute(text('SELECT COUNT(*) FROM prices')).scalar())
-" 2>/dev/null || echo "0")
+    n = c.execute(text('SELECT COUNT(*) FROM prices')).scalar()
+    last = c.execute(text('SELECT MAX(date) FROM prices')).scalar() or '2020-01-01'
+    print(f'{n}|{last}')
+" 2>/dev/null || echo "0|2020-01-01")
+ROW_COUNT="${DB_STATUS%|*}"
+LAST_DATE="${DB_STATUS#*|}"
+TODAY="$(date +%Y-%m-%d)"
+# Days behind today — if MAX(date) is within 7 days of today, backfill is "current enough"
+DAYS_BEHIND=$(python3 -c "
+from datetime import date
+last = date.fromisoformat('$LAST_DATE')
+print((date.fromisoformat('$TODAY') - last).days)
+" 2>/dev/null || echo "9999")
 
 if $SKIP_BACKFILL; then
     section "9. Historical backfill — SKIPPED (--skip-backfill)"
-elif [[ "$ROW_COUNT" -gt 100000 ]]; then
-    section "9. Historical backfill — already done"
-    ok "DB has $ROW_COUNT price rows; skipping backfill"
+elif [[ "$ROW_COUNT" -gt 100000 && "$DAYS_BEHIND" -le 7 ]]; then
+    section "9. Historical backfill — already current"
+    ok "DB has $ROW_COUNT price rows, latest date $LAST_DATE (only $DAYS_BEHIND days behind today)"
+elif [[ "$ROW_COUNT" -gt 100000 && "$DAYS_BEHIND" -gt 7 ]]; then
+    # Partial backfill detected — RESUME from where it stopped (e.g., SSH dropped mid-backfill)
+    section "9. Historical backfill — RESUMING from $LAST_DATE"
+    log "DB has $ROW_COUNT rows but latest date is $DAYS_BEHIND days behind today."
+    log "Likely a previous backfill was interrupted. Resuming..."
+    log "${DIM}Tip: run the deploy inside 'tmux new -s deploy' so SSH drops don't kill it.${NC}"
+    uv run stockagent backfill-bhav \
+        --start "$LAST_DATE" --end "$TODAY" --universe all 2>&1 | tail -10
+    ok "backfill resumed and completed"
 else
-    section "9. Historical backfill (~16 minutes)"
+    section "9. Historical backfill (~16 minutes — longer on slower VPS networks)"
     log "Pulling 6 years of NSE EQ bhav (full universe)..."
     log "${DIM}This is a one-time cost. Subsequent daily-tick runs add only today's bar.${NC}"
+    log "${YELLOW}STRONG SUGGESTION:${NC} run inside 'tmux new -s deploy' so SSH drops don't kill it."
+    if ! $NO_INTERACTIVE && [[ -z "${TMUX:-}" ]]; then
+        warn "You're NOT inside tmux. SSH disconnect = backfill dies."
+        read -rp "Continue anyway? [y/N] " yn
+        [[ "${yn,,}" == "y" ]] || die "Aborted. Run: tmux new -s deploy && ./deploy.sh"
+    fi
     uv run stockagent backfill-bhav \
-        --start 2020-01-01 --end "$(date +%Y-%m-%d)" --universe all 2>&1 | tail -5
+        --start 2020-01-01 --end "$TODAY" --universe all 2>&1 | tail -10
     ok "backfill done"
 fi
 
