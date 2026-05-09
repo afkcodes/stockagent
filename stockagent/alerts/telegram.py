@@ -128,67 +128,141 @@ def _find_font(size: int, bold: bool = False, mono: bool = False):
 
 def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count: int,
                                 fills: int, exits: dict, picks: list) -> bytes:
-    """Render the daily summary as a clean PNG card. Returns image bytes.
-    Plain monospace text on white; no fancy styling. Easy to read at a glance."""
+    """Render the daily summary as a clean PNG with a real table for picks.
+    Returns image bytes. Monospace + headers + row separators. No fancy styling."""
     from PIL import Image, ImageDraw
 
     starting = settings.capital_inr
     ret_pct = (nav - starting) / starting * 100
-    pnl_color = (16, 124, 16) if day_pnl >= 0 else (192, 32, 32)
+    black = (0, 0, 0)
     grey = (90, 90, 90)
-    light_grey = (200, 200, 200)
+    light_grey = (220, 220, 220)
+    pnl_color = (16, 124, 16) if day_pnl >= 0 else (192, 32, 32)
 
     title_font = _find_font(20, bold=True)
-    section_font = _find_font(15, bold=True)
-    body_font = _find_font(13, mono=True)
+    section_font = _find_font(14, bold=True)
+    header_font = _find_font(12, bold=True)
+    body_font = _find_font(12, mono=True)
     body_bold = _find_font(13, mono=True, bold=True)
 
-    width = 760
-    pad = 24
+    pad = 22
     line_h = 22
+    row_h = 26
 
-    # Build a list of (text, font, color) — None for blank line spacers.
-    # Note: DejaVuSansMono lacks the ₹ glyph and renders it as a box. Use "Rs"
-    # prefix to keep the card readable in any font available on Linux servers.
-    rows: list[tuple[str | None, object, tuple]] = []
-    rows.append((f"stockagent daily  -  {as_of}", title_font, (0, 0, 0)))
-    rows.append((None, body_font, (0, 0, 0)))  # spacer
-    rows.append((f"NAV       Rs {nav:>13,.0f}    ({ret_pct:+.2f}% from start)", body_font, (0, 0, 0)))
-    rows.append((f"Day P&L   Rs {day_pnl:>+13,.0f}", body_bold, pnl_color))
-    rows.append((f"Open: {open_count}   Fills: {fills}   Exits  stop:{exits.get('stop',0)}  signal:{exits.get('signal',0)}  time:{exits.get('time',0)}",
-                 body_font, grey))
-    rows.append((None, body_font, (0, 0, 0)))
+    # Column layout — (header, width_px, align)
+    cols = [
+        ("#",        30,  "right"),
+        ("Symbol",  120,  "left"),
+        ("Sector",   90,  "left"),
+        ("Entry",    95,  "right"),
+        ("Stop",     95,  "right"),
+        ("Target",   95,  "right"),
+        ("Qty",      55,  "right"),
+        ("Alloc Rs",100,  "right"),
+        ("Conv",     55,  "right"),
+    ]
+    col_gap = 12
+    table_width = sum(w for _, w, _ in cols) + col_gap * (len(cols) - 1)
+    width = pad * 2 + table_width
 
+    # Pre-compute column x ranges
+    col_ranges: list[tuple[int, int, str]] = []  # (x_start, x_end, align)
+    x = pad
+    for _, w, align in cols:
+        col_ranges.append((x, x + w, align))
+        x += w + col_gap
+
+    def _draw_cell(draw, y, text, font, color, x_start, x_end, align):
+        try:
+            tw = draw.textlength(text, font=font)
+        except AttributeError:
+            tw = font.getmask(text).size[0] if hasattr(font, "getmask") else len(text) * 7
+        if align == "right":
+            tx = x_end - tw
+        elif align == "center":
+            tx = x_start + (x_end - x_start - tw) / 2
+        else:
+            tx = x_start
+        draw.text((tx, y), text, fill=color, font=font)
+
+    # Compute total height
+    header_h = pad + line_h * 4 + 16  # title + 3 summary lines + bottom margin
     if picks:
-        rows.append((f"Tomorrow's watchlist  ({len(picks)} picks)", section_font, (0, 0, 0)))
-        rows.append(("-" * 78, body_font, light_grey))
-        for i, p in enumerate(picks, 1):
-            sector = (getattr(p, "sector", "-") or "-")[:14]
-            rr = (p.target - p.entry) / (p.entry - p.stop) if p.target and p.entry > p.stop else 0
-            rows.append((f"{i}. {p.symbol:<14s} {sector:<14s}  conviction {p.conviction:.2f}",
-                         body_bold, (0, 0, 0)))
-            rows.append((f"   entry Rs {p.entry:>9,.2f}   stop Rs {p.stop:>9,.2f}   tgt Rs {p.target:>9,.2f}   R:R 1:{rr:.1f}",
-                         body_font, grey))
-            rows.append((f"   qty {p.qty:>4}   alloc Rs {p.position_size_inr:>9,.0f}",
-                         body_font, grey))
-            if i < len(picks):
-                rows.append((None, body_font, (0, 0, 0)))
+        body_h = line_h + 8 + row_h + 4 + len(picks) * row_h + pad
     else:
-        rows.append(("No qualifying signals today.", body_font, grey))
-
-    # Compute height: full line for text rows, half for spacers
-    height = pad + sum(line_h if r[0] is not None else line_h // 2 for r in rows) + pad
+        body_h = line_h + pad
+    height = header_h + body_h
 
     img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(img)
 
+    # ─── Top: title + summary block ──────────────────────────────────────
     y = pad
-    for text, font, color in rows:
-        if text is not None:
-            draw.text((pad, y), text, fill=color, font=font)
-            y += line_h
-        else:
-            y += line_h // 2
+    draw.text((pad, y), f"stockagent daily  -  {as_of}", fill=black, font=title_font)
+    y += line_h + 6
+    draw.text((pad, y), f"NAV  Rs {nav:>13,.0f}    ({ret_pct:+.2f}% from start)",
+              fill=black, font=body_font)
+    y += line_h
+    draw.text((pad, y), f"Day P&L  Rs {day_pnl:>+13,.0f}",
+              fill=pnl_color, font=body_bold)
+    y += line_h
+    draw.text((pad, y),
+              f"Open: {open_count}   Fills: {fills}   "
+              f"Exits  stop:{exits.get('stop',0)}  signal:{exits.get('signal',0)}  time:{exits.get('time',0)}",
+              fill=grey, font=body_font)
+    y += line_h + 12
+
+    if not picks:
+        draw.text((pad, y), "No qualifying signals today.", fill=grey, font=body_font)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    # ─── Section title + table ────────────────────────────────────────────
+    draw.text((pad, y), f"Tomorrow's watchlist  ({len(picks)} picks)",
+              fill=black, font=section_font)
+    y += line_h + 8
+
+    # Table header row
+    for (header, _, _), (x_start, x_end, align) in zip(cols, col_ranges):
+        _draw_cell(draw, y, header, header_font, black, x_start, x_end, align)
+    y += row_h - 4
+
+    # Header underline
+    draw.line([(pad, y), (pad + table_width, y)], fill=black, width=1)
+    y += 6
+
+    # Data rows
+    for i, p in enumerate(picks):
+        sector = (getattr(p, "sector", "-") or "-")[:12]
+        row = [
+            str(i + 1),
+            p.symbol,
+            sector,
+            f"{p.entry:,.2f}",
+            f"{p.stop:,.2f}",
+            f"{p.target:,.2f}",
+            str(p.qty),
+            f"{p.position_size_inr:,.0f}",
+            f"{p.conviction:.2f}",
+        ]
+        for j, (cell, (x_start, x_end, align)) in enumerate(zip(row, col_ranges)):
+            # Symbol bold; numbers in grey for visual hierarchy
+            if j == 1:  # Symbol col
+                font = body_bold
+                color = black
+            elif j == 0:  # # col
+                font = body_font
+                color = grey
+            else:
+                font = body_font
+                color = black if j == 8 else grey  # conviction stays black for emphasis
+            _draw_cell(draw, y, cell, font, color, x_start, x_end, align)
+        y += row_h
+        # Light row separator
+        if i < len(picks) - 1:
+            draw.line([(pad, y - 3), (pad + table_width, y - 3)],
+                      fill=light_grey, width=1)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
