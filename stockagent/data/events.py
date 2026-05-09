@@ -33,59 +33,89 @@ _AVOID_PURPOSES = (
 )
 
 
-def refresh_corporate_actions(*, lookahead_days: int = 60) -> int:
-    """Pull corporate actions for the next 60 days from nselib and persist."""
-    try:
-        from nselib import capital_market
-    except ImportError:
-        return 0
-    today = date.today()
-    end = today + timedelta(days=lookahead_days)
-    try:
-        df = capital_market.corporate_action_data(
-            from_date=today.strftime("%d-%m-%Y"),
-            to_date=end.strftime("%d-%m-%Y"),
-        )
-    except Exception as e:
-        logger.warning(f"corporate_action_data fetch failed: {e}")
-        return 0
-    if df is None or df.empty:
-        return 0
-
+def _normalize_event_df(df, *, src_label: str) -> list[dict]:
+    """Convert an nselib events/corporate-actions dataframe into our row schema."""
+    if df is None or len(df) == 0:
+        return []
     df = df.rename(columns={c: c.strip() for c in df.columns})
     sym_col = next((c for c in df.columns if c.lower() == "symbol"), None)
-    ex_col = next((c for c in df.columns if "ex" in c.lower() and "date" in c.lower()), None)
-    purpose_col = next((c for c in df.columns if "purpose" in c.lower() or "subject" in c.lower()), None)
+    # Date column priority: exDate (corp_actions) → date (event_calendar) → any *date* col
+    date_candidates = ("exDate", "ex_date", "date")
+    ex_col = next((c for c in df.columns if c in date_candidates), None)
+    if not ex_col:
+        ex_col = next((c for c in df.columns if "date" in c.lower()), None)
+    purpose_col = next(
+        (c for c in df.columns if c.lower() in ("subject", "purpose", "description", "bm_desc")),
+        None,
+    )
     if not sym_col or not ex_col:
-        logger.warning(f"corporate_action_data unexpected schema: {list(df.columns)}")
-        return 0
+        logger.warning(f"{src_label} unexpected schema: {list(df.columns)}")
+        return []
 
-    rows = []
+    rows: list[dict] = []
     for _, r in df.iterrows():
         sym = str(r[sym_col]).strip().upper()
         ex_raw = str(r[ex_col]).strip()
+        if not sym or not ex_raw or ex_raw in ("-", "nan", "None"):
+            continue
         try:
             ex_date = pd.to_datetime(ex_raw, dayfirst=True, errors="coerce").date()
         except Exception:
             continue
-        if not sym or pd.isna(ex_date):
+        if pd.isna(ex_date):
             continue
         purpose = str(r[purpose_col]).strip() if purpose_col else ""
         rows.append({
-            "symbol": sym, "ex_date": str(ex_date),
-            "action_type": _classify_purpose(purpose), "details": purpose[:1000],
+            "symbol": sym,
+            "ex_date": str(ex_date),
+            "action_type": _classify_purpose(purpose),
+            "details": purpose[:1000],
         })
+    return rows
 
-    if not rows:
+
+def refresh_corporate_actions(*, lookahead_days: int = 60) -> int:
+    """Pull corporate actions + earnings event calendar for the next N days.
+
+    Combines two nselib endpoints:
+      - corporate_actions_for_equity: dividends, splits, bonuses, mergers
+      - event_calendar_for_equity:   board meetings, results dates
+    """
+    try:
+        from nselib import capital_market
+    except ImportError:
         return 0
+
+    today = date.today()
+    end = today + timedelta(days=lookahead_days)
+    from_str = today.strftime("%d-%m-%Y")
+    to_str = end.strftime("%d-%m-%Y")
+
+    all_rows: list[dict] = []
+
+    try:
+        df_ca = capital_market.corporate_actions_for_equity(from_date=from_str, to_date=to_str)
+        all_rows.extend(_normalize_event_df(df_ca, src_label="corporate_actions_for_equity"))
+    except Exception as e:
+        logger.warning(f"corporate_actions_for_equity fetch failed: {e}")
+
+    try:
+        df_ev = capital_market.event_calendar_for_equity(from_date=from_str, to_date=to_str)
+        all_rows.extend(_normalize_event_df(df_ev, src_label="event_calendar_for_equity"))
+    except Exception as e:
+        logger.warning(f"event_calendar_for_equity fetch failed: {e}")
+
+    if not all_rows:
+        return 0
+
     sql = text(
         """INSERT OR IGNORE INTO corporate_actions (symbol, ex_date, action_type, details)
            VALUES (:symbol, :ex_date, :action_type, :details)"""
     )
     with get_engine().begin() as c:
-        c.execute(sql, rows)
-    logger.info(f"corporate actions refreshed: {len(rows)} events")
-    return len(rows)
+        c.execute(sql, all_rows)
+    logger.info(f"corporate actions + events refreshed: {len(all_rows)} entries")
+    return len(all_rows)
 
 
 def _classify_purpose(purpose: str) -> str:
