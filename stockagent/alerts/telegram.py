@@ -129,8 +129,14 @@ def _find_font(size: int, bold: bool = False, mono: bool = False):
 def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count: int,
                                 fills: int, exits: dict, picks: list) -> bytes:
     """Render the daily summary as a clean PNG with a real table for picks.
-    Returns image bytes. Monospace + headers + row separators. No fancy styling."""
+    Returns image bytes. Monospace + headers + row separators. No fancy styling.
+
+    Rendered at 2x pixel density (SCALE=2) so text stays crisp on retina/HiDPI
+    phones. Telegram displays the image at the same physical size as before, but
+    each glyph has 4x the pixels, giving sharp anti-aliased rendering."""
     from PIL import Image, ImageDraw
+
+    SCALE = 2  # bump pixel density without changing logical layout
 
     starting = settings.capital_inr
     ret_pct = (nav - starting) / starting * 100
@@ -139,29 +145,29 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
     light_grey = (220, 220, 220)
     pnl_color = (16, 124, 16) if day_pnl >= 0 else (192, 32, 32)
 
-    title_font = _find_font(16, bold=True)
-    section_font = _find_font(12, bold=True)
-    header_font = _find_font(10, bold=True)
-    body_font = _find_font(10, mono=True)
-    body_bold = _find_font(11, mono=True, bold=True)
+    title_font = _find_font(16 * SCALE, bold=True)
+    section_font = _find_font(12 * SCALE, bold=True)
+    header_font = _find_font(10 * SCALE, bold=True)
+    body_font = _find_font(10 * SCALE, mono=True)
+    body_bold = _find_font(11 * SCALE, mono=True, bold=True)
 
-    pad = 14
-    line_h = 17
-    row_h = 20
+    pad = 14 * SCALE
+    line_h = 17 * SCALE
+    row_h = 20 * SCALE
 
     # Column layout — (header, width_px, align). Tightened for compactness.
     cols = [
-        ("#",       22, "right"),
-        ("Symbol",  92, "left"),
-        ("Sector",  70, "left"),
-        ("Entry",   70, "right"),
-        ("Stop",    70, "right"),
-        ("Target",  70, "right"),
-        ("Qty",     42, "right"),
-        ("Alloc",   72, "right"),
-        ("Conv",    42, "right"),
+        ("#",       22 * SCALE, "right"),
+        ("Symbol",  92 * SCALE, "left"),
+        ("Sector",  70 * SCALE, "left"),
+        ("Entry",   70 * SCALE, "right"),
+        ("Stop",    70 * SCALE, "right"),
+        ("Target",  70 * SCALE, "right"),
+        ("Qty",     42 * SCALE, "right"),
+        ("Alloc",   72 * SCALE, "right"),
+        ("Conv",    42 * SCALE, "right"),
     ]
-    col_gap = 8
+    col_gap = 8 * SCALE
     table_width = sum(w for _, w, _ in cols) + col_gap * (len(cols) - 1)
     width = pad * 2 + table_width
 
@@ -186,9 +192,9 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
         draw.text((tx, y), text, fill=color, font=font)
 
     # Compute total height
-    header_h = pad + line_h * 4 + 10  # title + 3 summary lines + bottom margin
+    header_h = pad + line_h * 4 + 10 * SCALE  # title + 3 summary lines + bottom margin
     if picks:
-        body_h = line_h + 4 + row_h + 4 + len(picks) * row_h + pad
+        body_h = line_h + 4 * SCALE + row_h + 4 * SCALE + len(picks) * row_h + pad
     else:
         body_h = line_h + pad
     height = header_h + body_h
@@ -199,7 +205,7 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
     # ─── Top: title + summary block ──────────────────────────────────────
     y = pad
     draw.text((pad, y), f"stockagent daily  -  {as_of}", fill=black, font=title_font)
-    y += line_h + 4
+    y += line_h + 4 * SCALE
     draw.text((pad, y), f"NAV  Rs {nav:>11,.0f}    ({ret_pct:+.2f}% from start)",
               fill=black, font=body_font)
     y += line_h
@@ -209,7 +215,7 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
     draw.text((pad, y),
               f"Open:{open_count}  Fills:{fills}  Exits  stop:{exits.get('stop',0)}  signal:{exits.get('signal',0)}  time:{exits.get('time',0)}",
               fill=grey, font=body_font)
-    y += line_h + 8
+    y += line_h + 8 * SCALE
 
     if not picks:
         draw.text((pad, y), "No qualifying signals today.", fill=grey, font=body_font)
@@ -220,16 +226,16 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
     # ─── Section title + table ────────────────────────────────────────────
     draw.text((pad, y), f"Tomorrow's watchlist  ({len(picks)} picks)",
               fill=black, font=section_font)
-    y += line_h + 4
+    y += line_h + 4 * SCALE
 
     # Table header row
     for (header, _, _), (x_start, x_end, align) in zip(cols, col_ranges):
         _draw_cell(draw, y, header, header_font, black, x_start, x_end, align)
-    y += row_h - 4
+    y += row_h - 4 * SCALE
 
     # Header underline
-    draw.line([(pad, y), (pad + table_width, y)], fill=black, width=1)
-    y += 6
+    draw.line([(pad, y), (pad + table_width, y)], fill=black, width=SCALE)
+    y += 6 * SCALE
 
     # Data rows
     for i, p in enumerate(picks):
@@ -260,8 +266,8 @@ def render_daily_summary_image(*, as_of, nav: float, day_pnl: float, open_count:
         y += row_h
         # Light row separator
         if i < len(picks) - 1:
-            draw.line([(pad, y - 3), (pad + table_width, y - 3)],
-                      fill=light_grey, width=1)
+            draw.line([(pad, y - 3 * SCALE), (pad + table_width, y - 3 * SCALE)],
+                      fill=light_grey, width=SCALE)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
