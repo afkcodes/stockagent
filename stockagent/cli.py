@@ -91,7 +91,9 @@ def backfill_cmd(universe: str, years: int, symbols: str | None, limit: int | No
 @click.option("--start", default=None, help="ISO YYYY-MM-DD; overrides --years")
 @click.option("--end", default=None, help="ISO YYYY-MM-DD; defaults to today")
 @click.option("--universe", default="all", type=click.Choice(["all", "nifty50", "nifty500"]))
-def backfill_bhav_cmd(years: int, start: str | None, end: str | None, universe: str) -> None:
+@click.option("--sleep-sec", default=0.2, type=float,
+              help="Pause between calls. Higher = friendlier to NSE rate-limits. Try 1.0-2.0 if backfill stalls.")
+def backfill_bhav_cmd(years: int, start: str | None, end: str | None, universe: str, sleep_sec: float) -> None:
     """Backfill via daily bhavcopies — best for universe-wide multi-year history."""
     from stockagent.data.nse import backfill_bhav_range, fetch_constituents
 
@@ -108,8 +110,8 @@ def backfill_bhav_cmd(years: int, start: str | None, end: str | None, universe: 
     else:
         console.print("Storing full EQ universe (~2,400 symbols/day)")
 
-    console.print(f"Bhav backfill {start_d} → {end_d} ({(end_d - start_d).days} days)")
-    res = backfill_bhav_range(start_d, end_d, symbols=sym_filter)
+    console.print(f"Bhav backfill {start_d} → {end_d} ({(end_d - start_d).days} days, sleep={sleep_sec}s)")
+    res = backfill_bhav_range(start_d, end_d, symbols=sym_filter, sleep_sec=sleep_sec)
     console.print(
         f"[green]Done.[/] {res['rows']:,} rows | "
         f"days: success={res['days_success']} skipped(holiday)={res['days_skipped']} "
