@@ -476,7 +476,11 @@ def daily_tick_cmd(universe, max_picks, min_conviction, skip_bhav_refresh, skip_
         return
     syms_for_decisions = fetch_constituents("Nifty 50") if universe == "nifty50" else fetch_constituents("Nifty 500")
     console.print(f"[cyan]→ paper-tick {latest} (universe {universe})[/]")
-    r = process_day(latest, universe=syms_for_decisions)
+    # generate_today=False: in live, run_coordinator (below) is the sole entry
+    # generator. The deterministic generate_decisions_for_day is replay-only —
+    # leaving it on here contaminated the live ledger with unranked alphabetical
+    # picks alongside the agent picks.
+    r = process_day(latest, universe=syms_for_decisions, generate_today=False)
     console.print(
         f"   fills={r.fills}  exits: stop={r.exits_stop} sig={r.exits_signal} time={r.exits_time}  "
         f"open={r.open_positions}  NAV ₹{r.nav:,.0f}  day P&L ₹{r.day_pnl:+,.0f}"
