@@ -1067,5 +1067,67 @@ def learn_report_cmd(limit: int) -> None:
         console.rule()
 
 
+@learn_cli.command("mine")
+@click.option("--window-days", default=None, type=int,
+              help="Only pool trades closed within N days (default: config; 0 = all).")
+@click.option("--source", "sources", multiple=True, type=click.Choice(["live", "backtest"]),
+              help="Restrict mining to these sources (repeatable; default: all).")
+def learn_mine_cmd(window_days: int | None, sources: tuple[str, ...]) -> None:
+    """Recompute agent_reliability + learned_patterns from the reviews corpus."""
+    from stockagent.db.session import run_migrations
+    from stockagent.learn.mine import recompute_all
+
+    applied = run_migrations()
+    if applied:
+        console.print(f"[yellow]migrations applied:[/] {', '.join(applied)}")
+    res = recompute_all(window_days=window_days, sources=list(sources) or None)
+    console.print(
+        f"[green]mined[/] {res['learned_patterns']} pattern buckets, "
+        f"{res['agent_reliability']} agent-reliability rows"
+    )
+
+
+@learn_cli.command("patterns")
+@click.option("--all", "show_all", is_flag=True, help="Show inactive buckets too.")
+@click.option("--limit", default=40, type=int, help="Max rows.")
+def learn_patterns_cmd(show_all: bool, limit: int) -> None:
+    """List mined patterns (active first) and agent reliability."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        where = "" if show_all else "WHERE is_active = 1"
+        rows = conn.execute(text(
+            f"""SELECT pattern_key, n, win_rate, avg_r, profit_factor, wilson_lb,
+                       conviction_mult, size_mult, is_active
+                FROM learned_patterns {where}
+                ORDER BY is_active DESC, n DESC LIMIT :lim"""
+        ), {"lim": limit}).mappings().all()
+        if not rows:
+            console.print("[yellow]no patterns — run `stockagent learn mine`[/]")
+            return
+        console.rule("learned patterns" + ("" if show_all else " (active)"))
+        for r in rows:
+            flag = "[green]●[/]" if r["is_active"] else "[dim]○[/]"
+            console.print(
+                f"  {flag} {r['pattern_key']:22s} n={r['n']:<4d} win {r['win_rate']*100:>5.1f}% "
+                f"avgR {r['avg_r'] if r['avg_r'] is not None else 'na':>6} "
+                f"PF {r['profit_factor'] if r['profit_factor'] is not None else 'na':>5} "
+                f"wLB {r['wilson_lb']:.2f}  conv×{r['conviction_mult']:.2f} size×{r['size_mult']:.2f}"
+            )
+
+        rel = conn.execute(text(
+            """SELECT agent, condition, n, win_rate, avg_r, wilson_lb
+               FROM agent_reliability ORDER BY agent, n DESC"""
+        )).mappings().all()
+        if rel:
+            console.rule("agent reliability")
+            for r in rel:
+                console.print(
+                    f"  {r['agent']:12s} {r['condition']:16s} n={r['n']:<4d} "
+                    f"win {r['win_rate']*100:>5.1f}% avgR {r['avg_r'] if r['avg_r'] is not None else 'na':>6} "
+                    f"wLB {r['wilson_lb']:.2f}"
+                )
+        console.rule()
+
+
 if __name__ == "__main__":
     cli()

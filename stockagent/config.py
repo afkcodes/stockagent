@@ -30,6 +30,17 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # --- Auto-learning (see docs/autolearn_design.md) ---
+    # Master kill-switch. While False, learned adjustments are computed + logged
+    # (shadow) but never applied to live conviction/sizing. Phase 3+ honours this.
+    autolearn_active: bool = Field(default=False, description="Apply learned adjustments to live picks")
+    # A pattern/reliability bucket needs at least this many closed trades before
+    # it can be marked is_active=1 and influence anything.
+    autolearn_min_n: int = Field(default=8, description="Min closed trades for a learned bucket to activate")
+    # Rolling window for mining; only trades closed within this many days are
+    # pooled. None/0 = use the whole corpus.
+    autolearn_window_days: int = Field(default=365, description="Rolling window (days) for mining; 0 = all history")
+
     @property
     def max_allocation_inr(self) -> float:
         return self.capital_inr * self.max_allocation_pct
