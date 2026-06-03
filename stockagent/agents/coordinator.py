@@ -56,6 +56,7 @@ class WatchlistEntry:
     conviction: float
     macro_multiplier: float
     rationale: str
+    disagreement: float = 0.0
     flags: list[str] = field(default_factory=list)
     per_agent: dict = field(default_factory=dict)
 
@@ -228,6 +229,7 @@ def run_coordinator(
             conviction=conv,
             macro_multiplier=macro_mult,
             rationale=rationale,
+            disagreement=combined.disagreement if combined else 0.0,
             flags=flags[:6],
             per_agent=per_agent_summary,
         ))
@@ -256,7 +258,7 @@ def _persist_picks(run_id: str, as_of: date, picks: list[WatchlistEntry], macro_
         "verdict": p.final_verdict, "conviction": p.conviction,
         "entry": p.entry, "stop": p.stop, "target": p.target,
         "pos": p.position_size_inr, "qty": p.qty,
-        "horizon": p.horizon_days, "disagreement": 0.0,
+        "horizon": p.horizon_days, "disagreement": p.disagreement,
         "rationale": (p.rationale[:1500] if p.rationale else "") + f" [macro_mult={macro_mult:.2f}]",
     } for p in picks]
     with get_engine().begin() as c:

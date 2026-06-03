@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     pnl_pct        REAL,
     slippage_bps   REAL,
     brokerage_inr  REAL,
+    initial_stop   REAL,                     -- stop at entry, immune to trailing (for R-multiple)
     status         TEXT NOT NULL DEFAULT 'open',  -- open | closed
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -199,3 +200,113 @@ CREATE TABLE IF NOT EXISTS market_movers (
 );
 CREATE INDEX IF NOT EXISTS idx_movers_symbol ON market_movers(symbol);
 CREATE INDEX IF NOT EXISTS idx_movers_date_cat ON market_movers(date, category);
+
+-- ---------------------------------------------------------------------------
+-- Auto-learning / evidence-backed feedback loop (see docs/autolearn_design.md)
+-- ---------------------------------------------------------------------------
+
+-- One row per CLOSED trade: frozen decision context joined to realized outcome.
+-- This is the learning corpus. See learn/capture.py.
+CREATE TABLE IF NOT EXISTS trade_reviews (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id          INTEGER NOT NULL REFERENCES paper_trades(id),
+    decision_id       INTEGER REFERENCES coordinator_decisions(id),
+    run_id            TEXT,
+    symbol            TEXT NOT NULL,
+    sector            TEXT,
+    source            TEXT NOT NULL DEFAULT 'live',   -- live | backtest
+    -- outcome
+    entry_date        TEXT,
+    exit_date         TEXT,
+    holding_days      INTEGER,
+    exit_reason       TEXT,
+    pnl_inr           REAL,
+    pnl_pct           REAL,
+    initial_risk_inr  REAL,                           -- (entry - initial_stop) * qty
+    r_multiple        REAL,                           -- pnl_inr / initial_risk_inr
+    mae_pct           REAL,                           -- max adverse excursion (worst unrealized %)
+    mfe_pct           REAL,                           -- max favorable excursion (best unrealized %)
+    -- regime attribution (alpha vs beta)
+    index_ret_pct     REAL,                           -- Nifty 50 proxy return over hold window
+    sector_ret_pct    REAL,                           -- sector-peer return over hold window
+    excess_ret_pct    REAL,                           -- pnl_pct - index_ret_pct
+    -- frozen decision context
+    conviction        REAL,
+    disagreement      REAL,
+    rsi_entry         REAL,
+    atr_pct_entry     REAL,
+    rr_ratio          REAL,
+    vix_state         TEXT,
+    nifty_trend       TEXT,
+    market_cap_band   TEXT,
+    context_json      TEXT,                           -- full frozen snapshot (agents + evidence)
+    -- labels
+    is_win            INTEGER,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(trade_id)
+);
+CREATE INDEX IF NOT EXISTS idx_treview_symbol ON trade_reviews(symbol);
+CREATE INDEX IF NOT EXISTS idx_treview_source ON trade_reviews(source);
+
+-- Aggregated agent reliability (Layer 2a). Recomputed on a rolling window.
+CREATE TABLE IF NOT EXISTS agent_reliability (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent         TEXT NOT NULL,
+    condition     TEXT NOT NULL,        -- e.g. 'bullish@conv>0.7'
+    n             INTEGER,
+    win_rate      REAL,
+    avg_r         REAL,
+    expectancy    REAL,
+    wilson_lb     REAL,
+    window_start  TEXT,
+    window_end    TEXT,
+    computed_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(agent, condition)
+);
+
+-- Aggregated outcome patterns (Layer 2b).
+CREATE TABLE IF NOT EXISTS learned_patterns (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_key     TEXT NOT NULL,        -- canonical bucket id
+    description     TEXT,
+    n               INTEGER,
+    win_rate        REAL,
+    avg_r           REAL,
+    expectancy      REAL,
+    profit_factor   REAL,
+    wilson_lb       REAL,
+    conviction_mult REAL,
+    size_mult       REAL,
+    is_active       INTEGER DEFAULT 0,
+    window_start    TEXT,
+    window_end      TEXT,
+    computed_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(pattern_key)
+);
+
+-- Audit log of every adjustment applied (or shadow-computed) per live decision.
+CREATE TABLE IF NOT EXISTS decision_adjustments (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           TEXT,
+    symbol           TEXT,
+    base_conviction  REAL,
+    adj_conviction   REAL,
+    conviction_mult  REAL,
+    size_mult        REAL,
+    matched_patterns TEXT,                -- JSON list of {pattern_key, reason}
+    shadow           INTEGER DEFAULT 1,   -- 1 = computed-but-not-applied
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_decadj_run ON decision_adjustments(run_id, symbol);
+
+-- LLM narrative lessons (Layer 4). Read-only context for future setups.
+CREATE TABLE IF NOT EXISTS trade_lessons (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_review_id INTEGER REFERENCES trade_reviews(id),
+    symbol          TEXT,
+    pattern_key     TEXT,                 -- for retrieval on similar setups
+    lesson          TEXT,
+    model           TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_lesson_pattern ON trade_lessons(pattern_key);

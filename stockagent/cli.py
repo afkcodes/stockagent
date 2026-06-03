@@ -989,5 +989,83 @@ def stats_cmd() -> None:
     )
 
 
+@cli.group("learn")
+def learn_cli() -> None:
+    """Auto-learning / evidence-backed feedback loop (see docs/autolearn_design.md)."""
+    pass
+
+
+@learn_cli.command("backfill")
+@click.option("--source", default="live", type=click.Choice(["live", "backtest"]),
+              help="Label these trades in trade_reviews.")
+@click.option("--limit", default=None, type=int, help="Max trades (smoke testing).")
+def learn_backfill_cmd(source: str, limit: int | None) -> None:
+    """Snapshot every closed trade into trade_reviews (idempotent upsert)."""
+    from stockagent.db.session import run_migrations
+    from stockagent.learn.capture import backfill_reviews
+
+    applied = run_migrations()
+    if applied:
+        console.print(f"[yellow]migrations applied:[/] {', '.join(applied)}")
+    n = backfill_reviews(source=source, limit=limit)
+    console.print(f"[green]recorded {n} trade_reviews[/] (source={source})")
+
+
+@learn_cli.command("report")
+@click.option("--limit", default=15, type=int, help="Rows to show.")
+def learn_report_cmd(limit: int) -> None:
+    """Summarize the trade_reviews corpus (R-multiple, win rate, alpha vs beta)."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        agg = conn.execute(text(
+            """SELECT COUNT(*) n,
+                      AVG(CASE WHEN is_win=1 THEN 1.0 ELSE 0.0 END) win_rate,
+                      AVG(r_multiple) avg_r, SUM(pnl_inr) pnl,
+                      AVG(excess_ret_pct) avg_excess,
+                      AVG(mae_pct) avg_mae, AVG(mfe_pct) avg_mfe
+               FROM trade_reviews"""
+        )).mappings().one()
+        if not agg["n"]:
+            console.print("[yellow]no trade_reviews yet — run `stockagent learn backfill`[/]")
+            return
+        console.rule("trade_reviews corpus")
+        console.print(
+            f"trades: [bold]{agg['n']}[/] | win rate [bold]{(agg['win_rate'] or 0)*100:.1f}%[/] | "
+            f"avg R [bold]{agg['avg_r'] or 0:+.2f}[/] | total ₹{agg['pnl'] or 0:+,.0f}"
+        )
+        console.print(
+            f"avg excess vs index [bold]{agg['avg_excess'] or 0:+.2f}%[/] | "
+            f"avg MAE {agg['avg_mae'] or 0:+.2f}% | avg MFE {agg['avg_mfe'] or 0:+.2f}%"
+        )
+
+        console.rule("by exit reason")
+        rows = conn.execute(text(
+            """SELECT exit_reason, COUNT(*) n,
+                      AVG(CASE WHEN is_win=1 THEN 1.0 ELSE 0.0 END) win_rate,
+                      AVG(r_multiple) avg_r, SUM(pnl_inr) pnl
+               FROM trade_reviews GROUP BY exit_reason ORDER BY n DESC"""
+        )).mappings().all()
+        for r in rows:
+            console.print(
+                f"  {r['exit_reason'] or '?':8s}  n={r['n']:<4d}  win {(r['win_rate'] or 0)*100:>5.1f}%  "
+                f"avg R {r['avg_r'] or 0:>+5.2f}  ₹{r['pnl'] or 0:>+10,.0f}"
+            )
+
+        console.rule(f"worst {limit} by R-multiple")
+        rows = conn.execute(text(
+            """SELECT symbol, entry_date, exit_date, r_multiple, pnl_inr,
+                      excess_ret_pct, exit_reason
+               FROM trade_reviews WHERE r_multiple IS NOT NULL
+               ORDER BY r_multiple ASC LIMIT :lim"""
+        ), {"lim": limit}).mappings().all()
+        for r in rows:
+            console.print(
+                f"  {r['symbol']:14s} {r['entry_date']}→{r['exit_date']}  "
+                f"R {r['r_multiple']:>+5.2f}  ₹{r['pnl_inr']:>+8,.0f}  "
+                f"excess {r['excess_ret_pct'] if r['excess_ret_pct'] is not None else 0:>+5.1f}%  {r['exit_reason']}"
+            )
+        console.rule()
+
+
 if __name__ == "__main__":
     cli()
