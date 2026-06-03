@@ -1011,6 +1011,22 @@ def learn_backfill_cmd(source: str, limit: int | None) -> None:
     console.print(f"[green]recorded {n} trade_reviews[/] (source={source})")
 
 
+@learn_cli.command("reset")
+@click.confirmation_option(prompt="Wipe ALL learning data (trade_reviews, patterns, "
+                                  "reliability, adjustments, lessons)? Prices & ledger are untouched.")
+def learn_reset_cmd() -> None:
+    """Clear the 5 learning tables for a clean start. Never touches prices or paper_trades."""
+    # Order respects FKs: trade_lessons → trade_reviews; the rest are standalone.
+    tables = ["trade_lessons", "trade_reviews", "learned_patterns",
+              "agent_reliability", "decision_adjustments"]
+    engine = get_engine()
+    with engine.begin() as c:
+        counts = {t: c.execute(text(f"DELETE FROM {t}")).rowcount for t in tables}
+    for t, n in counts.items():
+        console.print(f"  cleared [bold]{n:>6}[/] from {t}")
+    console.print("[green]learning corpus reset.[/] prices + paper_trades untouched.")
+
+
 @learn_cli.command("report")
 @click.option("--limit", default=15, type=int, help="Rows to show.")
 def learn_report_cmd(limit: int) -> None:
