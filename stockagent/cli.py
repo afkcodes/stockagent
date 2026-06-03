@@ -1129,5 +1129,51 @@ def learn_patterns_cmd(show_all: bool, limit: int) -> None:
         console.rule()
 
 
+@learn_cli.command("shadow")
+@click.option("--limit", default=30, type=int, help="Max rows.")
+@click.option("--matched-only", is_flag=True, help="Only rows where a pattern matched.")
+def learn_shadow_cmd(limit: int, matched_only: bool) -> None:
+    """Inspect the decision_adjustments audit log (what learning would do)."""
+    import json as _json
+    engine = get_engine()
+    with engine.connect() as conn:
+        agg = conn.execute(text(
+            """SELECT COUNT(*) n,
+                      SUM(CASE WHEN matched_patterns NOT IN ('[]','') AND matched_patterns IS NOT NULL
+                               THEN 1 ELSE 0 END) matched,
+                      SUM(CASE WHEN shadow=1 THEN 1 ELSE 0 END) shadow
+               FROM decision_adjustments"""
+        )).mappings().one()
+        if not agg["n"]:
+            console.print("[yellow]no adjustments logged yet — run a coordinator pass[/]")
+            return
+        console.rule("decision_adjustments")
+        console.print(
+            f"logged: [bold]{agg['n']}[/] | with a matched pattern [bold]{agg['matched'] or 0}[/] | "
+            f"shadow (not applied) [bold]{agg['shadow'] or 0}[/]"
+        )
+        where = ""
+        if matched_only:
+            where = "WHERE matched_patterns NOT IN ('[]','') AND matched_patterns IS NOT NULL"
+        rows = conn.execute(text(
+            f"""SELECT symbol, base_conviction, adj_conviction, conviction_mult,
+                       size_mult, matched_patterns, shadow, created_at
+                FROM decision_adjustments {where}
+                ORDER BY created_at DESC, id DESC LIMIT :lim"""
+        ), {"lim": limit}).mappings().all()
+        for r in rows:
+            try:
+                keys = ", ".join(m["pattern_key"] for m in _json.loads(r["matched_patterns"] or "[]"))
+            except (ValueError, TypeError):
+                keys = ""
+            tag = "[dim]shadow[/]" if r["shadow"] else "[green]LIVE[/]"
+            console.print(
+                f"  {r['symbol']:14s} {r['base_conviction']:.2f}→{r['adj_conviction']:.2f} "
+                f"conv×{r['conviction_mult']:.2f} size×{r['size_mult']:.2f} {tag}  "
+                f"[dim]{keys}[/]"
+            )
+        console.rule()
+
+
 if __name__ == "__main__":
     cli()
