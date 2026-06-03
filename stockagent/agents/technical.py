@@ -124,6 +124,14 @@ class TechnicalAgent(Agent):
             chart_url = None
 
         user_prompt = _format_user_prompt(symbol, signal_dict, recent_bars)
+        # Read-only enrichment: lessons from past losses in similar setups. Never
+        # changes the deterministic arithmetic — only what the judge gets to see.
+        prior_lessons = context.get("prior_lessons") or []
+        if prior_lessons:
+            from stockagent.learn.reflect import format_lessons_for_prompt
+            block = format_lessons_for_prompt(prior_lessons)
+            if block:
+                user_prompt = f"{user_prompt}\n\n{block}"
 
         try:
             resp = call_llm(

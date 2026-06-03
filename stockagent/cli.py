@@ -1129,6 +1129,41 @@ def learn_patterns_cmd(show_all: bool, limit: int) -> None:
         console.rule()
 
 
+@learn_cli.command("reflect")
+@click.option("--limit", default=20, type=int, help="Max losing trades to analyse.")
+@click.option("--source", default="live", type=click.Choice(["live", "backtest"]),
+              help="Which corpus of losses to reflect on.")
+@click.option("--force", is_flag=True, help="Regenerate even if a lesson exists.")
+def learn_reflect_cmd(limit: int, source: str, force: bool) -> None:
+    """LLM post-mortems on recent losses → trade_lessons (needs OPENROUTER_API_KEY)."""
+    from stockagent.learn.reflect import reflect_recent_losses
+    n = reflect_recent_losses(limit=limit, source=source, force=force)
+    console.print(f"[green]generated {n} lessons[/] (source={source})")
+
+
+@learn_cli.command("lessons")
+@click.option("--limit", default=20, type=int, help="Rows to show.")
+def learn_lessons_cmd(limit: int) -> None:
+    """List distinct trade lessons mined from losses."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        n = conn.execute(text("SELECT COUNT(DISTINCT trade_review_id) FROM trade_lessons")).scalar()
+        if not n:
+            console.print("[yellow]no lessons yet — run `stockagent learn reflect`[/]")
+            return
+        console.rule(f"trade lessons ({n} trades)")
+        rows = conn.execute(text(
+            """SELECT trade_review_id, symbol, lesson,
+                      GROUP_CONCAT(DISTINCT pattern_key) keys
+               FROM trade_lessons GROUP BY trade_review_id, lesson
+               ORDER BY trade_review_id DESC LIMIT :lim"""
+        ), {"lim": limit}).mappings().all()
+        for r in rows:
+            console.print(f"  [bold]{r['symbol']}[/] [dim]{r['keys']}[/]")
+            console.print(f"    {r['lesson']}")
+        console.rule()
+
+
 @learn_cli.command("shadow")
 @click.option("--limit", default=30, type=int, help="Max rows.")
 @click.option("--matched-only", is_flag=True, help="Only rows where a pattern matched.")

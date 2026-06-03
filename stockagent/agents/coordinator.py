@@ -159,6 +159,7 @@ def run_coordinator(
             "stop_dist_pct": (sig.entry_price - sig.stop_price) / sig.entry_price * 100,
         }
         ctx = {"signal": sig_dict, "recent_bars": bars, "as_of": as_of}
+        ctx["prior_lessons"] = _prior_lessons(sig)
         combined = orchestrator.evaluate(sig.symbol, ctx)
         persist_orchestrator_run(run_id, combined)
         scored.append((sig, combined))
@@ -248,6 +249,26 @@ def run_coordinator(
     _persist_picks(run_id, as_of, picks, macro_mult)
     _persist_adjustments(run_id, adjustments)
     return picks
+
+
+def _prior_lessons(sig: Signal) -> list[dict]:
+    """Read-only lessons from past losses in similar setups, for agent context.
+    Never raises into scoring; returns [] when none / on any error."""
+    try:
+        from stockagent.learn.apply import decision_features
+        from stockagent.learn.reflect import retrieve_lessons
+        snap = sig.indicator_snapshot or {}
+        atr = snap.get("atr14")
+        feats = decision_features(
+            sector=sector_for(sig.symbol),
+            rsi_entry=snap.get("rsi14"),
+            atr_pct_entry=(atr / sig.entry_price * 100.0) if (atr and sig.entry_price) else None,
+            rr_ratio=2.0,  # target is fixed at 2R
+        )
+        return retrieve_lessons(feats, limit=3)
+    except Exception as e:
+        logger.warning(f"prior_lessons failed for {sig.symbol}: {e}")
+        return []
 
 
 def _learned_adjustment(sig: Signal, combined: "CombinedVerdict | None", conv: float, sector: str):
