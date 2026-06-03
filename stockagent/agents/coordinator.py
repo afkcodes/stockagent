@@ -56,6 +56,7 @@ class WatchlistEntry:
     conviction: float
     macro_multiplier: float
     rationale: str
+    disagreement: float = 0.0
     flags: list[str] = field(default_factory=list)
     per_agent: dict = field(default_factory=dict)
 
@@ -158,6 +159,7 @@ def run_coordinator(
             "stop_dist_pct": (sig.entry_price - sig.stop_price) / sig.entry_price * 100,
         }
         ctx = {"signal": sig_dict, "recent_bars": bars, "as_of": as_of}
+        ctx["prior_lessons"] = _prior_lessons(sig)
         combined = orchestrator.evaluate(sig.symbol, ctx)
         persist_orchestrator_run(run_id, combined)
         scored.append((sig, combined))
@@ -182,6 +184,7 @@ def run_coordinator(
 
     # Apply sector concentration cap + position sizing + cash budget
     picks: list[WatchlistEntry] = []
+    adjustments: list = []          # (Adjustment) parallel to picks, for audit logging
     used_capital = 0.0
     sector_counts: dict[str, int] = defaultdict(int)
     for sig, combined, conv in candidates:
@@ -191,7 +194,16 @@ def run_coordinator(
         if sector_counts[sector] >= max_picks_per_sector:
             logger.info(f"sector cap hit: skipping {sig.symbol} ({sector})")
             continue
+
+        # --- Auto-learning adjustment (shadow unless settings.autolearn_active) ---
+        adj = _learned_adjustment(sig, combined, conv, sector)
+        eff_conv = adj.adj_conviction if settings.autolearn_active else conv
+        size_mult = adj.size_mult if settings.autolearn_active else 1.0
+
         qty, alloc = _size_position(sig.entry_price, sig.stop_price)
+        if size_mult != 1.0:
+            qty = int(qty * size_mult)
+            alloc = qty * sig.entry_price
         if qty <= 0:
             continue
         if used_capital + alloc > settings.capital_inr:
@@ -225,15 +237,72 @@ def run_coordinator(
             entry=sig.entry_price, stop=sig.stop_price, target=target,
             qty=qty, position_size_inr=alloc, horizon_days=20,
             final_verdict=combined.final_verdict if combined else "neutral",
-            conviction=conv,
+            conviction=eff_conv,
             macro_multiplier=macro_mult,
             rationale=rationale,
+            disagreement=combined.disagreement if combined else 0.0,
             flags=flags[:6],
             per_agent=per_agent_summary,
         ))
+        adjustments.append(adj)
 
     _persist_picks(run_id, as_of, picks, macro_mult)
+    _persist_adjustments(run_id, adjustments)
     return picks
+
+
+def _prior_lessons(sig: Signal) -> list[dict]:
+    """Read-only lessons from past losses in similar setups, for agent context.
+    Never raises into scoring; returns [] when none / on any error."""
+    try:
+        from stockagent.learn.apply import decision_features
+        from stockagent.learn.reflect import retrieve_lessons
+        snap = sig.indicator_snapshot or {}
+        atr = snap.get("atr14")
+        feats = decision_features(
+            sector=sector_for(sig.symbol),
+            rsi_entry=snap.get("rsi14"),
+            atr_pct_entry=(atr / sig.entry_price * 100.0) if (atr and sig.entry_price) else None,
+            rr_ratio=2.0,  # target is fixed at 2R
+        )
+        return retrieve_lessons(feats, limit=3)
+    except Exception as e:
+        logger.warning(f"prior_lessons failed for {sig.symbol}: {e}")
+        return []
+
+
+def _learned_adjustment(sig: Signal, combined: "CombinedVerdict | None", conv: float, sector: str):
+    """Build the decision-time feature vector and ask the learning layer for a
+    bounded conviction/size multiplier. Never raises into the decision path —
+    learning must not be able to break pick generation."""
+    from stockagent.learn.apply import compute_adjustment, decision_features
+
+    snap = sig.indicator_snapshot or {}
+    rsi = snap.get("rsi14")
+    atr = snap.get("atr14")
+    atr_pct = (atr / sig.entry_price * 100.0) if (atr and sig.entry_price) else None
+    stop_dist = sig.entry_price - sig.stop_price
+    rr = round((2 * stop_dist) / stop_dist, 3) if stop_dist > 0 else None  # target = entry + 2R
+    feats = decision_features(
+        sector=sector, conviction=conv, rr_ratio=rr,
+        rsi_entry=rsi, atr_pct_entry=atr_pct,
+    )
+    try:
+        return compute_adjustment(sig.symbol, conv, feats, shadow=not settings.autolearn_active)
+    except Exception as e:  # never let learning break the live path
+        logger.warning(f"learned_adjustment failed for {sig.symbol}: {e}")
+        from stockagent.learn.apply import Adjustment
+        return Adjustment(symbol=sig.symbol, base_conviction=conv, conviction_mult=1.0,
+                          size_mult=1.0, adj_conviction=conv, matched=[], shadow=True)
+
+
+def _persist_adjustments(run_id: str, adjustments: list) -> None:
+    from stockagent.learn.apply import persist_adjustment
+    for adj in adjustments:
+        try:
+            persist_adjustment(run_id, adj)
+        except Exception as e:
+            logger.warning(f"persist_adjustment failed for {adj.symbol}: {e}")
 
 
 def _persist_picks(run_id: str, as_of: date, picks: list[WatchlistEntry], macro_mult: float) -> None:
@@ -256,7 +325,7 @@ def _persist_picks(run_id: str, as_of: date, picks: list[WatchlistEntry], macro_
         "verdict": p.final_verdict, "conviction": p.conviction,
         "entry": p.entry, "stop": p.stop, "target": p.target,
         "pos": p.position_size_inr, "qty": p.qty,
-        "horizon": p.horizon_days, "disagreement": 0.0,
+        "horizon": p.horizon_days, "disagreement": p.disagreement,
         "rationale": (p.rationale[:1500] if p.rationale else "") + f" [macro_mult={macro_mult:.2f}]",
     } for p in picks]
     with get_engine().begin() as c:

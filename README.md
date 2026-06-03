@@ -45,6 +45,13 @@ The system is fully autonomous after deploy. You read the daily Telegram message
 - Sentiment agent: scans recent news headlines, hard veto on fraud/SEBI/auditor flags; weight 0.7
 - Macro agent: pure-rule regime classifier (India VIX + Nifty trend); produces deployment multiplier; weight 0.5
 
+**Auto-learning (evidence-backed feedback loop)**
+- Captures every closed trade (R-multiple, MAE/MFE, alpha-vs-beta regime attribution) into `trade_reviews`
+- Mines win rate / expectancy / Wilson-confidence patterns and per-agent reliability
+- Computes bounded conviction/size adjustments in **shadow mode** (logged, not applied — kill-switch defaults off)
+- LLM post-mortems on losses, resurfaced as read-only context on similar future setups
+- See "Auto-learning" section below; full design in `docs/autolearn_design.md`
+
 **Risk management (mechanical, not LLM-decided)**
 - ₹1,00,000 paper capital locked (configurable but enforced project-wide)
 - Max 20% allocation per stock
@@ -160,6 +167,95 @@ This is what we mean by "heartless": agents make judgments based on data, not fe
 
 ---
 
+## How historical data is used (backfill vs backtest)
+
+Two commands trip people up because both touch price history. Plain-terms split:
+
+**`backfill` = collect the data.**
+Downloads NSE daily prices (2020→present, ~3,100 stocks) into the local SQLite DB. It doesn't trade or decide anything — it just stocks the shelves. Run once to load everything, then a little each day (`daily-tick` step 1) to add the newest bar.
+
+**`backtest` = test a strategy on that data.**
+Takes a trading rule (e.g. "buy when RSI < 30"), replays it day-by-day over the stored history, and tallies the pretend P&L. No live market, no real money — a pure simulation answering "would this rule have worked?" This is how we decided to trade *only* RSI mean-reversion (see Validated results).
+
+**The live system is NOT independent of the data — it leans on it every day.**
+To judge whether a stock is a buy *today*, `daily-tick` loads that stock's recent months of prices and computes RSI/ATR on the spot. No history → no indicators → no signals. The price data underpins everything.
+
+**But the live system IS independent of backtest *results*.**
+The backtest was a one-time judging exercise. Once it told us "RSI mean-reversion is the only survivor," that choice was hard-coded. Day to day, the live system never re-reads backtest output — it just trades the chosen strategy.
+
+```
+HISTORICAL PRICE DATA  (backfill)
+        │
+        ├──→ OFFLINE: backtest / walkforward  → picked "RSI mean-reversion"   (one time)
+        │
+        └──→ LIVE every day: compute RSI/ATR → today's signals               (forever)
+```
+
+| Aspect                | `backfill`                       | `backtest`                          |
+| --------------------- | -------------------------------- | ----------------------------------- |
+| What it does          | Downloads & stores past prices   | Tests a trading rule on those prices |
+| Touches the market?   | Yes — fetches real data          | No — pure simulation                |
+| Makes trade decisions?| No                               | Yes, but pretend ones in the past   |
+| Used live?            | **Yes** — daily, to compute signals | No — offline validation only     |
+| Run it…               | First, then daily to top up      | When testing/validating an idea     |
+
+A third, related use is **`paper-replay`**: it simulates the *whole* live system (signals + sizing + exits) over a past window to build a paper track record before risking anything real — see Daily usage. Note it runs the deterministic path (no LLM), so its trades carry no agent verdicts.
+
+---
+
+## Auto-learning (evidence-backed feedback loop)
+
+The base system has **no memory of its own trades** — it judges each day from scratch. The auto-learning layer (`stockagent/learn/`) gives it that memory: it records every closed trade, mines evidence-backed patterns from the wins and losses, and feeds that evidence back into future decisions. Full design in [`docs/autolearn_design.md`](./docs/autolearn_design.md).
+
+**Guiding principle — the same "heartless" ethos as the combine step:**
+
+> **Statistics (deterministic, evidence-backed) move the arithmetic. LLMs only narrate and hypothesize.** Every self-adjustment is written to the DB with the evidence behind it, and is reversible / shadow-able.
+
+So conviction and sizing are only ever moved by mined statistics with a confidence test — never directly by an LLM. The LLM's role is to write human-readable post-mortems, which enrich judgment but never touch the math.
+
+### The five layers
+
+| Phase | Layer | What it does | Behaviour change | Status |
+| ----- | ----- | ------------ | ---------------- | ------ |
+| 1 | **Capture** | On each close, snapshot the frozen decision context + realized outcome into `trade_reviews` (R-multiple, MAE/MFE, alpha-vs-beta regime attribution) | none (pure data) | ✅ built |
+| 2 | **Mine** | Aggregate reviews into `learned_patterns` + `agent_reliability` — win rate, expectancy (R), profit factor, Wilson-CI confidence per bucket | none (read-only) | ✅ built |
+| 3 | **Shadow** | Per live candidate, compute a bounded conviction/size multiplier from active patterns and log it to `decision_adjustments` — **applies nothing** | none (logged only) | ✅ built |
+| 4 | **Activate** | Flip `autolearn_active`: the logged multipliers actually move conviction + size | **live** | ⏸ deliberately deferred |
+| 5 | **Reflect** | An analyst LLM writes a structured lesson on each loss into `trade_lessons`; matching lessons resurface as read-only context to the agents on similar future setups | enriched context | ✅ built |
+
+### Key metrics it computes (none existed before)
+
+- **R-multiple** = `realized_pnl / initial_risk` — normalizes every trade to "units of risk made/lost", so a small win on a tight stop and a big win on a wide stop are comparable. The single most important learning signal.
+- **MAE / MFE** — max adverse / favorable excursion during the hold ("was it deep underwater before it worked?").
+- **Regime attribution** — index & sector return over the *same* window, so a loss in a −8% market (beta) isn't punished like a loss while the market rose (alpha). Without this the system would learn to hate good strategies caught in a bad tape.
+
+### Guardrails (what separates learning from overfitting to noise)
+
+- **No look-ahead** — patterns applied on day D use only trades closed before D.
+- **Min sample + confidence** — a bucket is `is_active` only with ≥ `autolearn_min_n` trades AND a Wilson-CI test that it confidently beats (or trails) a coin flip. Thin/ambiguous buckets influence nothing.
+- **Bounded multipliers** — conviction ∈ [0.5, 1.3], size ∈ [0.5, 1.5]; no single thin pattern can dominate.
+- **Shadow-first + kill-switch** — `settings.autolearn_active` defaults **off**. The loop computes and logs against real picks until the log proves the adjustments would raise expectancy. Until then, **picks are byte-for-byte unchanged.**
+
+### Why Phase 4 is not flipped yet
+
+Activation is gated on real validation. The current corpus is ~368 *replay-experiment* trades (`source='backtest'`, deterministic, no agent verdicts) — useful bootstrap priors, not live edge. Flipping the switch on that would teach the system an artifact. The honest bottleneck is **trade volume**: the loop becomes statistically meaningful only after dozens of *live* trades accrue, at which point the shadow log is reviewed before trusting it with capital.
+
+### CLI
+
+```bash
+uv run stockagent learn backfill    # snapshot closed trades → trade_reviews
+uv run stockagent learn mine        # recompute learned_patterns + agent_reliability
+uv run stockagent learn patterns    # inspect mined patterns (active first)
+uv run stockagent learn shadow      # inspect the decision_adjustments audit log
+uv run stockagent learn reflect     # LLM post-mortems on recent losses → trade_lessons
+uv run stockagent learn lessons     # read the mined lessons
+uv run stockagent learn report      # summarize the trade_reviews corpus
+```
+
+New tables: `trade_reviews`, `learned_patterns`, `agent_reliability`, `decision_adjustments`, `trade_lessons`. All decision lineage (`run_id` → `agent_outputs` → `coordinator_decisions` → `paper_trades`) already existed — the learning loop just reads it back.
+
+---
+
 ## Validated results
 
 Walk-forward validation across 8 rolling 6-month windows (2020-06-01 to 2026-05-06), Nifty 500 universe:
@@ -260,6 +356,17 @@ uv run stockagent walkforward rsi_mean_reversion --universe nifty500
 
 # Replay paper trading over a historical window
 uv run stockagent paper-replay --start 2024-01-01 --end 2024-06-30 --reset
+```
+
+For the auto-learning loop (see "Auto-learning" section):
+
+```bash
+uv run stockagent learn backfill    # snapshot closed trades → trade_reviews
+uv run stockagent learn mine        # recompute patterns + agent reliability
+uv run stockagent learn patterns    # inspect mined patterns (active first)
+uv run stockagent learn shadow      # inspect the decision_adjustments audit log
+uv run stockagent learn reflect     # LLM post-mortems on recent losses
+uv run stockagent learn lessons     # read the mined lessons
 ```
 
 ---
@@ -409,6 +516,13 @@ stockagent/
 │   ├── paper_trade/
 │   │   └── ledger.py          # closed-loop daily simulation
 │   │
+│   ├── learn/                 # auto-learning feedback loop (see docs/autolearn_design.md)
+│   │   ├── metrics.py         # R-multiple, MAE/MFE, regime attribution
+│   │   ├── capture.py         # snapshot closed trades → trade_reviews
+│   │   ├── mine.py            # aggregate → learned_patterns + agent_reliability
+│   │   ├── apply.py           # shadow conviction/size multipliers → decision_adjustments
+│   │   └── reflect.py         # LLM loss post-mortems → trade_lessons
+│   │
 │   └── alerts/
 │       └── telegram.py        # direct Bot API push, no extra deps
 │
@@ -490,6 +604,7 @@ See `ROADMAP.md` for which of these are tracked as future work and which are "de
 | `ACTIONS.md`  | Operator's daily playbook. What to do today (`.env`), what to run daily.           |
 | `DEPLOY.md`   | Full deployment reference. Manual steps if you don't want to use `deploy.sh`.      |
 | `ROADMAP.md`  | What's built, what's deferred. Tier 1/2/3 priorities with effort estimates.        |
+| `docs/autolearn_design.md` | Full design of the auto-learning feedback loop (5 layers, data model, guardrails). |
 | `deploy.sh`   | Idempotent one-shot Ubuntu VPS deploy. Run from project root.                      |
 | `README.md`   | This file.                                                                         |
 

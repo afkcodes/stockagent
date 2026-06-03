@@ -989,5 +989,226 @@ def stats_cmd() -> None:
     )
 
 
+@cli.group("learn")
+def learn_cli() -> None:
+    """Auto-learning / evidence-backed feedback loop (see docs/autolearn_design.md)."""
+    pass
+
+
+@learn_cli.command("backfill")
+@click.option("--source", default="live", type=click.Choice(["live", "backtest"]),
+              help="Label these trades in trade_reviews.")
+@click.option("--limit", default=None, type=int, help="Max trades (smoke testing).")
+def learn_backfill_cmd(source: str, limit: int | None) -> None:
+    """Snapshot every closed trade into trade_reviews (idempotent upsert)."""
+    from stockagent.db.session import run_migrations
+    from stockagent.learn.capture import backfill_reviews
+
+    applied = run_migrations()
+    if applied:
+        console.print(f"[yellow]migrations applied:[/] {', '.join(applied)}")
+    n = backfill_reviews(source=source, limit=limit)
+    console.print(f"[green]recorded {n} trade_reviews[/] (source={source})")
+
+
+@learn_cli.command("report")
+@click.option("--limit", default=15, type=int, help="Rows to show.")
+def learn_report_cmd(limit: int) -> None:
+    """Summarize the trade_reviews corpus (R-multiple, win rate, alpha vs beta)."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        agg = conn.execute(text(
+            """SELECT COUNT(*) n,
+                      AVG(CASE WHEN is_win=1 THEN 1.0 ELSE 0.0 END) win_rate,
+                      AVG(r_multiple) avg_r, SUM(pnl_inr) pnl,
+                      AVG(excess_ret_pct) avg_excess,
+                      AVG(mae_pct) avg_mae, AVG(mfe_pct) avg_mfe
+               FROM trade_reviews"""
+        )).mappings().one()
+        if not agg["n"]:
+            console.print("[yellow]no trade_reviews yet — run `stockagent learn backfill`[/]")
+            return
+        console.rule("trade_reviews corpus")
+        console.print(
+            f"trades: [bold]{agg['n']}[/] | win rate [bold]{(agg['win_rate'] or 0)*100:.1f}%[/] | "
+            f"avg R [bold]{agg['avg_r'] or 0:+.2f}[/] | total ₹{agg['pnl'] or 0:+,.0f}"
+        )
+        console.print(
+            f"avg excess vs index [bold]{agg['avg_excess'] or 0:+.2f}%[/] | "
+            f"avg MAE {agg['avg_mae'] or 0:+.2f}% | avg MFE {agg['avg_mfe'] or 0:+.2f}%"
+        )
+
+        console.rule("by exit reason")
+        rows = conn.execute(text(
+            """SELECT exit_reason, COUNT(*) n,
+                      AVG(CASE WHEN is_win=1 THEN 1.0 ELSE 0.0 END) win_rate,
+                      AVG(r_multiple) avg_r, SUM(pnl_inr) pnl
+               FROM trade_reviews GROUP BY exit_reason ORDER BY n DESC"""
+        )).mappings().all()
+        for r in rows:
+            console.print(
+                f"  {r['exit_reason'] or '?':8s}  n={r['n']:<4d}  win {(r['win_rate'] or 0)*100:>5.1f}%  "
+                f"avg R {r['avg_r'] or 0:>+5.2f}  ₹{r['pnl'] or 0:>+10,.0f}"
+            )
+
+        console.rule(f"worst {limit} by R-multiple")
+        rows = conn.execute(text(
+            """SELECT symbol, entry_date, exit_date, r_multiple, pnl_inr,
+                      excess_ret_pct, exit_reason
+               FROM trade_reviews WHERE r_multiple IS NOT NULL
+               ORDER BY r_multiple ASC LIMIT :lim"""
+        ), {"lim": limit}).mappings().all()
+        for r in rows:
+            console.print(
+                f"  {r['symbol']:14s} {r['entry_date']}→{r['exit_date']}  "
+                f"R {r['r_multiple']:>+5.2f}  ₹{r['pnl_inr']:>+8,.0f}  "
+                f"excess {r['excess_ret_pct'] if r['excess_ret_pct'] is not None else 0:>+5.1f}%  {r['exit_reason']}"
+            )
+        console.rule()
+
+
+@learn_cli.command("mine")
+@click.option("--window-days", default=None, type=int,
+              help="Only pool trades closed within N days (default: config; 0 = all).")
+@click.option("--source", "sources", multiple=True, type=click.Choice(["live", "backtest"]),
+              help="Restrict mining to these sources (repeatable; default: all).")
+def learn_mine_cmd(window_days: int | None, sources: tuple[str, ...]) -> None:
+    """Recompute agent_reliability + learned_patterns from the reviews corpus."""
+    from stockagent.db.session import run_migrations
+    from stockagent.learn.mine import recompute_all
+
+    applied = run_migrations()
+    if applied:
+        console.print(f"[yellow]migrations applied:[/] {', '.join(applied)}")
+    res = recompute_all(window_days=window_days, sources=list(sources) or None)
+    console.print(
+        f"[green]mined[/] {res['learned_patterns']} pattern buckets, "
+        f"{res['agent_reliability']} agent-reliability rows"
+    )
+
+
+@learn_cli.command("patterns")
+@click.option("--all", "show_all", is_flag=True, help="Show inactive buckets too.")
+@click.option("--limit", default=40, type=int, help="Max rows.")
+def learn_patterns_cmd(show_all: bool, limit: int) -> None:
+    """List mined patterns (active first) and agent reliability."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        where = "" if show_all else "WHERE is_active = 1"
+        rows = conn.execute(text(
+            f"""SELECT pattern_key, n, win_rate, avg_r, profit_factor, wilson_lb,
+                       conviction_mult, size_mult, is_active
+                FROM learned_patterns {where}
+                ORDER BY is_active DESC, n DESC LIMIT :lim"""
+        ), {"lim": limit}).mappings().all()
+        if not rows:
+            console.print("[yellow]no patterns — run `stockagent learn mine`[/]")
+            return
+        console.rule("learned patterns" + ("" if show_all else " (active)"))
+        for r in rows:
+            flag = "[green]●[/]" if r["is_active"] else "[dim]○[/]"
+            console.print(
+                f"  {flag} {r['pattern_key']:22s} n={r['n']:<4d} win {r['win_rate']*100:>5.1f}% "
+                f"avgR {r['avg_r'] if r['avg_r'] is not None else 'na':>6} "
+                f"PF {r['profit_factor'] if r['profit_factor'] is not None else 'na':>5} "
+                f"wLB {r['wilson_lb']:.2f}  conv×{r['conviction_mult']:.2f} size×{r['size_mult']:.2f}"
+            )
+
+        rel = conn.execute(text(
+            """SELECT agent, condition, n, win_rate, avg_r, wilson_lb
+               FROM agent_reliability ORDER BY agent, n DESC"""
+        )).mappings().all()
+        if rel:
+            console.rule("agent reliability")
+            for r in rel:
+                console.print(
+                    f"  {r['agent']:12s} {r['condition']:16s} n={r['n']:<4d} "
+                    f"win {r['win_rate']*100:>5.1f}% avgR {r['avg_r'] if r['avg_r'] is not None else 'na':>6} "
+                    f"wLB {r['wilson_lb']:.2f}"
+                )
+        console.rule()
+
+
+@learn_cli.command("reflect")
+@click.option("--limit", default=20, type=int, help="Max losing trades to analyse.")
+@click.option("--source", default="live", type=click.Choice(["live", "backtest"]),
+              help="Which corpus of losses to reflect on.")
+@click.option("--force", is_flag=True, help="Regenerate even if a lesson exists.")
+def learn_reflect_cmd(limit: int, source: str, force: bool) -> None:
+    """LLM post-mortems on recent losses → trade_lessons (needs OPENROUTER_API_KEY)."""
+    from stockagent.learn.reflect import reflect_recent_losses
+    n = reflect_recent_losses(limit=limit, source=source, force=force)
+    console.print(f"[green]generated {n} lessons[/] (source={source})")
+
+
+@learn_cli.command("lessons")
+@click.option("--limit", default=20, type=int, help="Rows to show.")
+def learn_lessons_cmd(limit: int) -> None:
+    """List distinct trade lessons mined from losses."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        n = conn.execute(text("SELECT COUNT(DISTINCT trade_review_id) FROM trade_lessons")).scalar()
+        if not n:
+            console.print("[yellow]no lessons yet — run `stockagent learn reflect`[/]")
+            return
+        console.rule(f"trade lessons ({n} trades)")
+        rows = conn.execute(text(
+            """SELECT trade_review_id, symbol, lesson,
+                      GROUP_CONCAT(DISTINCT pattern_key) keys
+               FROM trade_lessons GROUP BY trade_review_id, lesson
+               ORDER BY trade_review_id DESC LIMIT :lim"""
+        ), {"lim": limit}).mappings().all()
+        for r in rows:
+            console.print(f"  [bold]{r['symbol']}[/] [dim]{r['keys']}[/]")
+            console.print(f"    {r['lesson']}")
+        console.rule()
+
+
+@learn_cli.command("shadow")
+@click.option("--limit", default=30, type=int, help="Max rows.")
+@click.option("--matched-only", is_flag=True, help="Only rows where a pattern matched.")
+def learn_shadow_cmd(limit: int, matched_only: bool) -> None:
+    """Inspect the decision_adjustments audit log (what learning would do)."""
+    import json as _json
+    engine = get_engine()
+    with engine.connect() as conn:
+        agg = conn.execute(text(
+            """SELECT COUNT(*) n,
+                      SUM(CASE WHEN matched_patterns NOT IN ('[]','') AND matched_patterns IS NOT NULL
+                               THEN 1 ELSE 0 END) matched,
+                      SUM(CASE WHEN shadow=1 THEN 1 ELSE 0 END) shadow
+               FROM decision_adjustments"""
+        )).mappings().one()
+        if not agg["n"]:
+            console.print("[yellow]no adjustments logged yet — run a coordinator pass[/]")
+            return
+        console.rule("decision_adjustments")
+        console.print(
+            f"logged: [bold]{agg['n']}[/] | with a matched pattern [bold]{agg['matched'] or 0}[/] | "
+            f"shadow (not applied) [bold]{agg['shadow'] or 0}[/]"
+        )
+        where = ""
+        if matched_only:
+            where = "WHERE matched_patterns NOT IN ('[]','') AND matched_patterns IS NOT NULL"
+        rows = conn.execute(text(
+            f"""SELECT symbol, base_conviction, adj_conviction, conviction_mult,
+                       size_mult, matched_patterns, shadow, created_at
+                FROM decision_adjustments {where}
+                ORDER BY created_at DESC, id DESC LIMIT :lim"""
+        ), {"lim": limit}).mappings().all()
+        for r in rows:
+            try:
+                keys = ", ".join(m["pattern_key"] for m in _json.loads(r["matched_patterns"] or "[]"))
+            except (ValueError, TypeError):
+                keys = ""
+            tag = "[dim]shadow[/]" if r["shadow"] else "[green]LIVE[/]"
+            console.print(
+                f"  {r['symbol']:14s} {r['base_conviction']:.2f}→{r['adj_conviction']:.2f} "
+                f"conv×{r['conviction_mult']:.2f} size×{r['size_mult']:.2f} {tag}  "
+                f"[dim]{keys}[/]"
+            )
+        console.rule()
+
+
 if __name__ == "__main__":
     cli()

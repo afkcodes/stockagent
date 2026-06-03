@@ -338,6 +338,13 @@ def process_day(d: date, *, costs: CostModel | None = None, generate_today: bool
                            pnl_inr=:pnl, pnl_pct=:pct, status='closed', brokerage_inr = COALESCE(brokerage_inr,0) + :sc
                        WHERE id=:id"""
                 ), {"px": exit_fill, "d": str(d), "r": exit_reason, "pnl": pnl, "pct": pnl_pct, "sc": sell_cost, "id": pos["id"]})
+            # Auto-learning: snapshot the closed trade into trade_reviews.
+            # Best-effort — a capture failure must never break the trading cycle.
+            try:
+                from stockagent.learn.capture import record_trade_review
+                record_trade_review(pos["id"], source="live")
+            except Exception as e:
+                logger.warning(f"trade_review capture failed for trade {pos['id']}: {e}")
             if exit_reason == "stop":
                 exits_stop += 1
             elif exit_reason == "time":
@@ -392,9 +399,10 @@ def process_day(d: date, *, costs: CostModel | None = None, generate_today: bool
         with engine.begin() as c:
             c.execute(text(
                 """INSERT INTO paper_trades (decision_id, symbol, side, qty, entry_price, entry_date,
-                                             brokerage_inr, status)
-                   VALUES (:dec_id, :sym, 'BUY', :qty, :px, :d, :bc, 'open')"""
-            ), {"dec_id": dec["id"], "sym": sym, "qty": qty, "px": fill, "d": str(d), "bc": buy_cost})
+                                             brokerage_inr, initial_stop, status)
+                   VALUES (:dec_id, :sym, 'BUY', :qty, :px, :d, :bc, :istop, 'open')"""
+            ), {"dec_id": dec["id"], "sym": sym, "qty": qty, "px": fill, "d": str(d),
+                "bc": buy_cost, "istop": dec.get("stop_loss")})
         fills += 1
         held_syms.add(sym)
         open_positions.append({"id": None, "decision_id": dec["id"], "symbol": sym, "qty": qty, "entry_price": fill, "entry_date": d, "status": "open"})

@@ -69,7 +69,37 @@ def init_db() -> Path:
         for stmt in _split_sql(schema_sql):
             if stmt.strip():
                 conn.execute(text(stmt))
+    run_migrations()
     return Path(settings.stockagent_db_path)
+
+
+# Idempotent ALTERs for columns that CREATE TABLE IF NOT EXISTS can't add to an
+# already-existing table. Safe to run on every init / learn command.
+_COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
+    # (table, column, "ALTER ... ADD COLUMN ...")
+    ("paper_trades", "initial_stop", "ALTER TABLE paper_trades ADD COLUMN initial_stop REAL"),
+]
+
+
+def _existing_columns(conn, table: str) -> set[str]:
+    rows = conn.execute(text(f"PRAGMA table_info({table})")).mappings().all()
+    return {r["name"] for r in rows}
+
+
+def run_migrations() -> list[str]:
+    """Apply additive column migrations idempotently. Returns the list applied."""
+    engine = get_engine()
+    applied: list[str] = []
+    with engine.begin() as conn:
+        for table, column, ddl in _COLUMN_MIGRATIONS:
+            try:
+                cols = _existing_columns(conn, table)
+            except Exception:
+                continue  # table doesn't exist yet; schema create will handle it
+            if column not in cols:
+                conn.execute(text(ddl))
+                applied.append(f"{table}.{column}")
+    return applied
 
 
 def _split_sql(sql: str) -> list[str]:
