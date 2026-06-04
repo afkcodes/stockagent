@@ -28,35 +28,11 @@ from stockagent.config import settings
 from stockagent.data.loader import load_prices
 from stockagent.db.session import get_engine
 
-_TIME_STOP_DAYS = 30  # max holding period if neither stop nor target hit
 _RSI_EXIT = 60        # mean-reversion exit threshold (matches strategies.py)
 
-# Trailing stop config
-_TRAIL_TRIGGER_PCT = 0.05   # activate trailing after position is up >+5%
-_TRAIL_ATR_MULT = 1.5       # trailing distance = 1.5 × ATR(14)
-
-
-def _trailing_stop_for(symbol: str, d: date, current_close: float, current_stop: float) -> float:
-    """Return the BETTER of (current_stop, trailing_stop_today). Stops only RATCHET UP.
-
-    Trailing rule: if position is up >5% from entry, set stop = max(current_stop,
-    current_close - 1.5 × ATR(14)). Locks in profit while letting winners run.
-    """
-    end_ts = pd.Timestamp(d)
-    start = end_ts - pd.Timedelta(days=80)
-    df = load_prices(symbol, start=start.date(), end=d)
-    if df.empty:
-        return current_stop
-    df = df.droplevel("symbol").sort_index()
-    from stockagent.indicators.compute import add_indicators
-    df = add_indicators(df, ["atr14"])
-    if df.empty or pd.isna(df["atr14"].iloc[-1]):
-        return current_stop
-    atr = float(df["atr14"].iloc[-1])
-    if not math.isfinite(atr) or atr <= 0:
-        return current_stop
-    candidate = current_close - _TRAIL_ATR_MULT * atr
-    return max(current_stop, candidate)  # never lower the stop
+# NOTE: the trailing stop and 30-day time stop were removed — they were not part
+# of the validated strategy and cut winners short (see process_day exits). Re-add
+# only after validating them through the backtest engine.
 
 
 @dataclass
@@ -117,9 +93,27 @@ def _open_positions_today() -> list[dict]:
     engine = get_engine()
     with engine.connect() as c:
         return [dict(r) for r in c.execute(text(
-            """SELECT id, decision_id, symbol, qty, entry_price, entry_date, status
+            """SELECT id, decision_id, symbol, qty, entry_price, entry_date,
+                      initial_stop AS stop, status
                FROM paper_trades WHERE status = 'open'"""
         )).mappings()]
+
+
+def _size_at_fill(entry_price: float, stop_price: float | None, cash_available: float) -> int:
+    """Integer qty honouring 5% risk-per-trade, 20% allocation, and available cash.
+    Identical to backtest.engine._size_position so the ledger and the validated
+    backtest size positions the same way. Returns 0 if not sizeable."""
+    if (not entry_price or entry_price <= 0 or stop_price is None
+            or not math.isfinite(stop_price) or stop_price >= entry_price):
+        return 0
+    stop_dist = entry_price - stop_price
+    if stop_dist <= 0:
+        return 0
+    cap = settings.capital_inr
+    qty_by_risk = int((cap * settings.max_risk_per_trade_pct) // stop_dist)
+    qty_by_alloc = int((cap * settings.max_allocation_pct) // entry_price)
+    qty_by_cash = int(cash_available // entry_price)
+    return max(0, min(qty_by_risk, qty_by_alloc, qty_by_cash))
 
 
 def _decisions_made_on(d: date) -> list[dict]:
@@ -173,7 +167,10 @@ def _signal_exit_today(symbol: str, d: date) -> bool:
     Computed against the prior trading day so we exit at today's open, not today's close
     (avoids same-bar entry+exit when RSI rebounds fast)."""
     end_ts = pd.Timestamp(d)
-    start = end_ts - pd.Timedelta(days=80)
+    # Ample warmup (~270 trading days) so RSI(14) is stable and CONSISTENT with the
+    # entry-side computation. An 80-day window seeded RSI differently and produced
+    # phantom RSI>60 readings that flushed positions in ~2 days — the core ledger bug.
+    start = end_ts - pd.Timedelta(days=400)
     # We want indicator values as of the bar BEFORE today, so the exit fires at today's open.
     df = load_prices(symbol, start=start.date(), end=(end_ts - pd.Timedelta(days=1)).date())
     if df.empty:
@@ -190,11 +187,14 @@ def generate_decisions_for_day(
     d: date,
     symbols: list[str],
     *,
-    max_picks: int = 5,
+    max_picks: int | None = None,
 ) -> int:
     """Deterministic-only decision generator for replay/backfill. NO LLM calls.
-    Writes to coordinator_decisions so process_day can fill them next bar.
-    Idempotent: if decisions already exist for this date, returns 0."""
+    Writes ONE decision per entry signal (like the backtest engine — take all
+    signals; process_day cash-limits at fill). process_day re-sizes at fill, so
+    the qty stored here is only a reference. Idempotent per date.
+
+    `max_picks` optionally caps the number of decisions (None = all signals)."""
     engine = get_engine()
     with engine.connect() as c:
         existing = c.execute(text(
@@ -208,24 +208,21 @@ def generate_decisions_for_day(
     if not sigs:
         return 0
 
-    # Size positions, respecting locks. We can't fully respect cumulative cash here
-    # since process_day handles cash; we only enforce per-trade caps.
+    # Deterministic, stable order (by symbol) so cash-limited fills are reproducible.
+    sigs = sorted(sigs, key=lambda s: s.symbol)
+    if max_picks is not None:
+        sigs = sigs[:max_picks]
+
     rows = []
     run_id = f"replay-{d.isoformat()}"
-    used = 0.0
-    for s in sigs[:max_picks * 2]:  # generous over-pick; size limits trim further
+    for s in sigs:
         stop_dist = s.entry_price - s.stop_price
         if stop_dist <= 0:
             continue
-        qty_by_risk = int((settings.capital_inr * settings.max_risk_per_trade_pct) // stop_dist)
-        qty_by_alloc = int((settings.capital_inr * settings.max_allocation_pct) // s.entry_price)
-        qty = max(0, min(qty_by_risk, qty_by_alloc))
+        # Reference qty (process_day re-sizes against live cash at fill).
+        qty = _size_at_fill(s.entry_price, s.stop_price, settings.capital_inr)
         if qty == 0:
             continue
-        alloc = qty * s.entry_price
-        if used + alloc > settings.capital_inr:
-            continue
-        used += alloc
         target = s.entry_price + 2 * stop_dist
         rows.append({
             "run_id": run_id,
@@ -235,14 +232,12 @@ def generate_decisions_for_day(
             "entry": s.entry_price,
             "stop": s.stop_price,
             "target": target,
-            "pos": alloc,
+            "pos": qty * s.entry_price,
             "qty": qty,
             "horizon": 20,
             "rationale": f"deterministic replay: {s.rationale}",
             "created_at": f"{d} 18:00:00",
         })
-        if len(rows) >= max_picks:
-            break
 
     if not rows:
         return 0
@@ -276,54 +271,80 @@ def process_day(d: date, *, costs: CostModel | None = None, generate_today: bool
         prior_nav = float(v) if v is not None else float(settings.capital_inr)
 
     cash, open_positions = _current_cash_and_positions()
-    bars = _bars_for_date(d, [p["symbol"] for p in open_positions])
+
+    # Yesterday's coordinator picks = today's pending entries (fill at today's open).
+    yesterday = d - timedelta(days=1)
+    while yesterday.weekday() >= 5:  # walk back over weekends
+        yesterday -= timedelta(days=1)
+    decisions = _decisions_made_on(yesterday)
+
+    sym_universe = {p["symbol"] for p in open_positions} | {dec["symbol"] for dec in decisions}
+    bars = _bars_for_date(d, sym_universe)
 
     fills = exits_stop = exits_signal = exits_time = 0
+    held_syms = {p["symbol"] for p in open_positions}
+    with engine.connect() as c:
+        already_filled = set(
+            c.execute(text("SELECT decision_id FROM paper_trades WHERE decision_id IS NOT NULL")).scalars().all()
+        )
 
-    # --- Step 1: process exits for already-open positions on bar d ---
+    # --- Step 1: fill pending entries at today's OPEN (mirrors backtest engine) ---
+    # Highest-conviction first (live), symbol-stable for ties (replay determinism).
+    # Size with min(risk, alloc, cash) AT FILL; one per symbol; skip if cash short.
+    for dec in sorted(decisions, key=lambda x: (-(x.get("conviction") or 0.0), x["symbol"])):
+        sym = dec["symbol"]
+        if dec["id"] in already_filled or sym in held_syms or sym not in bars:
+            continue
+        open_px = float(bars[sym]["open"])
+        if not math.isfinite(open_px):
+            continue
+        fill = costs.slip_buy(open_px)
+        stop = dec.get("stop_loss")
+        qty = _size_at_fill(fill, stop, cash)
+        if qty <= 0:
+            continue
+        value = qty * fill
+        buy_cost = costs.buy_cost(value)
+        if cash < value + buy_cost:
+            continue  # engine skips rather than partial-filling
+        cash -= value + buy_cost
+        with engine.begin() as c:
+            res = c.execute(text(
+                """INSERT INTO paper_trades (decision_id, symbol, side, qty, entry_price, entry_date,
+                                             brokerage_inr, initial_stop, status)
+                   VALUES (:dec_id, :sym, 'BUY', :qty, :px, :d, :bc, :istop, 'open')"""
+            ), {"dec_id": dec["id"], "sym": sym, "qty": qty, "px": fill, "d": str(d),
+                "bc": buy_cost, "istop": stop})
+            new_id = res.lastrowid
+        fills += 1
+        held_syms.add(sym)
+        open_positions.append({"id": new_id, "decision_id": dec["id"], "symbol": sym,
+                               "qty": qty, "entry_price": fill, "entry_date": d,
+                               "stop": stop, "status": "open"})
+
+    # --- Step 2: exits on bar d — signal exit at open, then intraday stop ---
+    # Mirrors the validated backtest engine: FIXED stop + strategy signal exit only
+    # (no trailing, no time stop). A position entered TODAY can stop out same bar
+    # but cannot signal-exit (it had no prior-day signal).
     new_open: list[dict] = []
     for pos in open_positions:
         sym = pos["symbol"]
         if sym not in bars:
             new_open.append(pos)
             continue
-        bar = bars[sym]
-        low = float(bar["low"])
-        open_px = float(bar["open"])
-        close_px = float(bar["close"])
-        entry_date = pd.Timestamp(pos["entry_date"]).date()
-        days_held = (d - entry_date).days
-
-        # Pull stop from the originating decision
-        with engine.connect() as c:
-            stop = c.execute(
-                text("SELECT stop_loss FROM coordinator_decisions WHERE id = :id"),
-                {"id": pos["decision_id"]},
-            ).scalar()
+        low = float(bars[sym]["low"])
+        open_px = float(bars[sym]["open"])
+        stop = pos.get("stop")
         stop = float(stop) if stop is not None else None
+        entered_before_today = pd.Timestamp(pos["entry_date"]).date() < d
 
-        exit_reason = None
-        exit_fill = None
-        # Trailing-stop adjustment: if position is up >5%, ratchet stop up.
-        if stop is not None and math.isfinite(stop):
-            unrealized_pct = (close_px - pos["entry_price"]) / pos["entry_price"]
-            if unrealized_pct >= _TRAIL_TRIGGER_PCT:
-                new_stop = _trailing_stop_for(sym, d, close_px, stop)
-                if new_stop > stop:
-                    with engine.begin() as cc:
-                        cc.execute(text("UPDATE coordinator_decisions SET stop_loss = :s WHERE id = :id"),
-                                   {"s": new_stop, "id": pos["decision_id"]})
-                    stop = new_stop
-        if stop is not None and math.isfinite(stop) and low <= stop:
-            exit_fill = costs.slip_sell(min(open_px, stop))
-            exit_reason = "stop"  # could be original stop or trailing stop — both labelled 'stop'
-        elif days_held >= _TIME_STOP_DAYS:
-            exit_fill = costs.slip_sell(close_px)
-            exit_reason = "time"
-        elif _signal_exit_today(sym, d):
-            # Signal fired yesterday → fill at today's open (no same-bar entry+exit)
+        exit_reason = exit_fill = None
+        if entered_before_today and _signal_exit_today(sym, d):
             exit_fill = costs.slip_sell(open_px)
             exit_reason = "signal"
+        elif stop is not None and math.isfinite(stop) and low <= stop:
+            exit_fill = costs.slip_sell(min(open_px, stop))
+            exit_reason = "stop"
 
         if exit_reason:
             value = pos["qty"] * exit_fill
@@ -338,8 +359,6 @@ def process_day(d: date, *, costs: CostModel | None = None, generate_today: bool
                            pnl_inr=:pnl, pnl_pct=:pct, status='closed', brokerage_inr = COALESCE(brokerage_inr,0) + :sc
                        WHERE id=:id"""
                 ), {"px": exit_fill, "d": str(d), "r": exit_reason, "pnl": pnl, "pct": pnl_pct, "sc": sell_cost, "id": pos["id"]})
-            # Auto-learning: snapshot the closed trade into trade_reviews.
-            # Best-effort — a capture failure must never break the trading cycle.
             try:
                 from stockagent.learn.capture import record_trade_review
                 record_trade_review(pos["id"], source="live")
@@ -347,65 +366,12 @@ def process_day(d: date, *, costs: CostModel | None = None, generate_today: bool
                 logger.warning(f"trade_review capture failed for trade {pos['id']}: {e}")
             if exit_reason == "stop":
                 exits_stop += 1
-            elif exit_reason == "time":
-                exits_time += 1
             else:
                 exits_signal += 1
         else:
             new_open.append(pos)
 
     open_positions = new_open
-
-    # --- Step 2: fill yesterday's coordinator picks at today's open ---
-    yesterday = d - timedelta(days=1)
-    while yesterday.weekday() >= 5:  # walk back over weekends
-        yesterday -= timedelta(days=1)
-    decisions = _decisions_made_on(yesterday)
-    if decisions:
-        sym_set = {dec["symbol"] for dec in decisions}
-        bars = {**bars, **_bars_for_date(d, sym_set)}
-
-    held_syms = {p["symbol"] for p in open_positions}
-    # Idempotency: skip decisions already filled in a prior process_day run
-    with engine.connect() as c:
-        already_filled = set(
-            c.execute(text("SELECT decision_id FROM paper_trades WHERE decision_id IS NOT NULL")).scalars().all()
-        )
-
-    for dec in decisions:
-        sym = dec["symbol"]
-        if dec["id"] in already_filled:
-            continue
-        if sym in held_syms:
-            continue
-        if sym not in bars:
-            continue
-        bar = bars[sym]
-        open_px = float(bar["open"])
-        if not math.isfinite(open_px):
-            continue
-        fill = costs.slip_buy(open_px)
-        qty = int(dec["qty"])
-        value = qty * fill
-        buy_cost = costs.buy_cost(value)
-        if cash < value + buy_cost:
-            allowable = cash - 1
-            qty = int(allowable / fill)
-            if qty <= 0:
-                continue
-            value = qty * fill
-            buy_cost = costs.buy_cost(value)
-        cash -= value + buy_cost
-        with engine.begin() as c:
-            c.execute(text(
-                """INSERT INTO paper_trades (decision_id, symbol, side, qty, entry_price, entry_date,
-                                             brokerage_inr, initial_stop, status)
-                   VALUES (:dec_id, :sym, 'BUY', :qty, :px, :d, :bc, :istop, 'open')"""
-            ), {"dec_id": dec["id"], "sym": sym, "qty": qty, "px": fill, "d": str(d),
-                "bc": buy_cost, "istop": dec.get("stop_loss")})
-        fills += 1
-        held_syms.add(sym)
-        open_positions.append({"id": None, "decision_id": dec["id"], "symbol": sym, "qty": qty, "entry_price": fill, "entry_date": d, "status": "open"})
 
     # --- Step 3: mark to market with today's close ---
     if open_positions:
@@ -443,20 +409,77 @@ def process_day(d: date, *, costs: CostModel | None = None, generate_today: bool
     )
 
 
-def replay_range(start: date, end: date, *, universe: list[str]) -> list[TickResult]:
-    """Replay all trading days in [start, end] sequentially. Idempotent.
-    Generates deterministic decisions on each day for next-bar fills."""
-    days = _trading_days_in_db(start, end)
-    out: list[TickResult] = []
-    for d in days:
-        r = process_day(d, universe=universe)
-        out.append(r)
-        logger.info(
-            f"{d}: fills={r.fills} stops={r.exits_stop} sig={r.exits_signal} "
-            f"time={r.exits_time} open={r.open_positions} nav=₹{r.nav:,.0f} "
-            f"pnl=₹{r.day_pnl:+,.0f}"
-        )
-    return out
+def _persist_backtest_result(res, *, source: str = "replay") -> None:
+    """Write a BacktestResult's trades + daily equity into paper_trades and
+    portfolio_state, so paper-status / learn backfill see the same numbers the
+    engine produced."""
+    engine = get_engine()
+    trade_rows = []
+    for t in res.trades:
+        closed = t.exit_price is not None
+        trade_rows.append({
+            "symbol": t.symbol, "qty": t.qty,
+            "entry_price": float(t.entry_price),
+            "entry_date": str(pd.Timestamp(t.entry_date).date()),
+            "exit_price": float(t.exit_price) if closed else None,
+            "exit_date": str(pd.Timestamp(t.exit_date).date()) if closed and t.exit_date is not None else None,
+            "exit_reason": t.exit_reason, "istop": float(t.stop) if t.stop is not None else None,
+            "pnl_inr": float(t.pnl_inr) if closed else None,
+            "pnl_pct": float(t.pnl_pct) if closed else None,
+            "bc": float(t.costs_inr), "status": "closed" if closed else "open",
+        })
+    state_rows = []
+    prev_nav = float(res.starting_capital)
+    for d, row in res.equity_curve.iterrows():
+        nav = float(row["nav"])
+        state_rows.append({
+            "d": str(pd.Timestamp(d).date()), "cash": float(row["cash"]),
+            "dep": float(row["mtm"]), "pos": "[]", "nav": nav, "pnl": nav - prev_nav,
+        })
+        prev_nav = nav
+
+    with engine.begin() as c:
+        if trade_rows:
+            c.execute(text(
+                """INSERT INTO paper_trades
+                       (symbol, side, qty, entry_price, entry_date, exit_price, exit_date,
+                        exit_reason, initial_stop, pnl_inr, pnl_pct, brokerage_inr, status)
+                   VALUES (:symbol,'BUY',:qty,:entry_price,:entry_date,:exit_price,:exit_date,
+                           :exit_reason,:istop,:pnl_inr,:pnl_pct,:bc,:status)"""
+            ), trade_rows)
+        if state_rows:
+            c.execute(text(
+                """INSERT INTO portfolio_state
+                       (date, cash_inr, deployed_inr, open_positions_json, nav_inr, day_pnl_inr)
+                   VALUES (:d,:cash,:dep,:pos,:nav,:pnl)
+                   ON CONFLICT(date) DO UPDATE SET
+                     cash_inr=excluded.cash_inr, deployed_inr=excluded.deployed_inr,
+                     nav_inr=excluded.nav_inr, day_pnl_inr=excluded.day_pnl_inr"""
+            ), state_rows)
+
+
+def replay_range(start: date, end: date, *, universe: list[str], strategy=None):
+    """Replay [start, end] through the VALIDATED backtest engine and persist the
+    result. The engine — not the live process_day fill loop — is the source of
+    truth: a cash-limited day-by-day re-implementation path-diverges from it, so
+    replay uses the engine directly. process_day remains the LIVE execution path.
+
+    Returns the BacktestResult."""
+    from stockagent.backtest.engine import run_backtest
+    from stockagent.backtest.strategies import RsiMeanReversion
+
+    strategy = strategy or RsiMeanReversion()
+    res = run_backtest(strategy, symbols=universe, start=start, end=end)
+    _persist_backtest_result(res)
+    closed = [t for t in res.trades if t.exit_price is not None]
+    wins = sum(1 for t in closed if t.pnl_inr > 0)
+    ret = (res.final_nav - res.starting_capital) / res.starting_capital * 100
+    logger.info(
+        f"replay {start}..{end}: {len(closed)} trades, "
+        f"win {wins/len(closed)*100:.1f}% nav ₹{res.final_nav:,.0f} ({ret:+.2f}%)"
+        if closed else f"replay {start}..{end}: no trades"
+    )
+    return res
 
 
 def reset_paper_state() -> None:

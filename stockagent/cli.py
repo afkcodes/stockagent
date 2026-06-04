@@ -654,7 +654,8 @@ def telegram_init_cmd(write_env: bool, timeout: int) -> None:
 @click.option("--universe", default="nifty500", type=click.Choice(["nifty50", "nifty500"]))
 @click.option("--reset/--no-reset", default=False, help="Wipe paper_trades + portfolio_state first")
 def paper_replay_cmd(start: str, end: str | None, universe: str, reset: bool) -> None:
-    """Replay deterministic paper trading over a date range and rebuild portfolio_state."""
+    """Replay paper trading over a date range via the validated backtest engine."""
+    from collections import Counter
     from stockagent.data.nse import fetch_constituents
     from stockagent.paper_trade.ledger import replay_range, reset_paper_state
     from stockagent.signals.daily import latest_trading_day_in_db
@@ -668,18 +669,20 @@ def paper_replay_cmd(start: str, end: str | None, universe: str, reset: bool) ->
         console.print("[yellow]Reset:[/] paper_trades + portfolio_state cleared")
 
     console.print(f"[bold]Replay:[/] {start_d} → {end_d}  universe={universe} ({len(syms)})")
-    results = replay_range(start_d, end_d, universe=syms)
-    if not results:
-        console.print("[red]No trading days found in DB for that range.[/]")
+    res = replay_range(start_d, end_d, universe=syms)
+    closed = [t for t in res.trades if t.exit_price is not None]
+    if not closed:
+        console.print("[red]No trades in that range.[/]")
         return
-    final = results[-1]
-    starting = settings.capital_inr
-    total_ret = (final.nav - starting) / starting * 100
+    starting = res.starting_capital
+    total_ret = (res.final_nav - starting) / starting * 100
+    wins = sum(1 for t in closed if t.pnl_inr > 0)
+    mix = Counter(t.exit_reason for t in closed)
     console.print(
-        f"\n[bold]Final[/]  NAV ₹{final.nav:,.0f}  (start ₹{starting:,.0f})  "
-        f"return [bold]{total_ret:+.2f}%[/]  open_positions={final.open_positions}\n"
-        f"  total fills:  {sum(r.fills for r in results)}\n"
-        f"  exits — stop: {sum(r.exits_stop for r in results)}  signal: {sum(r.exits_signal for r in results)}  time: {sum(r.exits_time for r in results)}"
+        f"\n[bold]Final[/]  NAV ₹{res.final_nav:,.0f}  (start ₹{starting:,.0f})  "
+        f"return [bold]{total_ret:+.2f}%[/]\n"
+        f"  trades: {len(closed)}   win rate: {wins/len(closed)*100:.1f}%\n"
+        f"  exits — {dict(mix)}"
     )
 
 
